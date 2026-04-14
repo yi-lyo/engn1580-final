@@ -1,5 +1,5 @@
-#include <portaudio.h>
 #include <math.h>
+#include <portaudio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -13,13 +13,10 @@ typedef struct {
 float sintable[FRAMES_PER_BUFFER];
 
 // This callback is called by PortAudio whenever it needs more audio
-static int audioCallback(
-    const void *inputBuffer, void *outputBuffer,
-    unsigned long framesPerBuffer,
-    const PaStreamCallbackTimeInfo *timeInfo,
-    PaStreamCallbackFlags statusFlags,
-    void *userData)
-{
+static int audioCallback(const void *inputBuffer, void *outputBuffer,
+                         unsigned long framesPerBuffer,
+                         const PaStreamCallbackTimeInfo *timeInfo,
+                         PaStreamCallbackFlags statusFlags, void *userData) {
     // CallbackData *data = (CallbackData *)userData;
     // float *out = (float *)outputBuffer;
 
@@ -36,15 +33,12 @@ int main(void) {
     PaStream *stream;
 
     Pa_Initialize();
-    Pa_OpenDefaultStream(&stream,
-        0, 1,               // no input, 1 output channel
-        paFloat32,          // 32-bit float samples
-        SAMPLE_RATE,
-        FRAMES_PER_BUFFER,
-        audioCallback, &data);
+    Pa_OpenDefaultStream(&stream, 0, 1, // no input, 1 output channel
+                         paFloat32,     // 32-bit float samples
+                         SAMPLE_RATE, FRAMES_PER_BUFFER, audioCallback, &data);
 
     Pa_StartStream(stream);
-    Pa_Sleep(3000);         // play for 3 seconds
+    Pa_Sleep(3000); // play for 3 seconds
     Pa_StopStream(stream);
     Pa_CloseStream(stream);
     Pa_Terminate();
