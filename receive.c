@@ -7,10 +7,10 @@
 #include <string.h>
 
 #define SAMPLE_RATE 48000
-#define FRAMES_PER_BUFFER 256
+#define FRAMES_PER_BUFFER 0x1000
 
-#define FREQ1_CYCLES_PER_BUFFER 4
-#define FREQ2_CYCLES_PER_BUFFER 6
+#define FREQ1_CYCLES_PER_BUFFER 0x40
+#define FREQ2_CYCLES_PER_BUFFER 0x60
 
 // Precomputed lookup tables of e^(-i 2 pi f t)
 float complex exptable1[FRAMES_PER_BUFFER];
@@ -51,7 +51,7 @@ int main(void) {
 
     PaError err;
     PaStream *stream;
-    callback_data_t user_data = {0, 1024};
+    callback_data_t user_data = {0, 256};
 
     err = Pa_Initialize();
     if (err != paNoError) {
