@@ -10,8 +10,9 @@
 #   make help       # shows targets/overrides
 
 CC      ?= gcc
-TARGET  := transmit
-SRC     := transmit.c
+TARGETS := transmit receive
+SRC_TRANSMIT := transmit.c
+SRC_RECEIVE := receive.c
 
 # Keep flags minimal to match the provided compile command exactly.
 # You can override/add flags from the command line, e.g.:
@@ -22,22 +23,25 @@ LDLIBS  ?= -lportaudio -lm
 
 .PHONY: all run clean help
 
-all: $(TARGET)
+all: $(TARGETS)
 
-$(TARGET): $(SRC)
+transmit: $(SRC_TRANSMIT)
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $< $(LDLIBS)
 
-run: $(TARGET)
-	./$(TARGET)
+receive: $(SRC_RECEIVE)
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $< $(LDLIBS)
+
+run: transmit
+	./transmit
 
 clean:
-	rm -f $(TARGET) *.o
+	rm -f $(TARGETS) *.o
 
 help:
 	@printf "%s\n" \
 	"Targets:" \
-	"  all (default)  Build ./$(TARGET)" \
-	"  run            Build then run ./$(TARGET)" \
+	"  all (default)  Build ./$(TARGETS)" \
+	"  run            Build then run ./transmit" \
 	"  clean          Remove build artifacts" \
 	"" \
 	"Variables you can override:" \
