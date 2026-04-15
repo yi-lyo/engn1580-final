@@ -7,7 +7,10 @@
 
 #define SAMPLE_RATE 48000
 #define FRAMES_PER_BUFFER 256
-#define BUFFERS_PER_SYMBOL 16
+#define BUFFERS_PER_SYMBOL 64
+
+#define FREQ1_CYCLES_PER_BUFFER 4
+#define FREQ2_CYCLES_PER_BUFFER 6
 
 typedef struct {
     size_t callback_count;
@@ -15,9 +18,9 @@ typedef struct {
     size_t num_symbols;
 } callback_data_t;
 
-float sintable[FRAMES_PER_BUFFER];
+float sintable1[FRAMES_PER_BUFFER];
 float sintable2[FRAMES_PER_BUFFER];
-float *audio_bufs[2] = {sintable, sintable2};
+float *audio_bufs[2] = {sintable1, sintable2};
 
 uint8_t *symbol_buf;
 
@@ -101,8 +104,10 @@ int main(void) {
     size_t num_symbols = buf_length << 3;
 
     for (size_t i = 0; i < FRAMES_PER_BUFFER; i++) {
-        sintable[i] = sinf((i * 8.0f * M_PI) / FRAMES_PER_BUFFER);
-        sintable2[i] = sinf((i * 12.0f * M_PI) / FRAMES_PER_BUFFER);
+        sintable1[i] = sinf((i * FREQ1_CYCLES_PER_BUFFER * 2.0f * M_PI) /
+                           FRAMES_PER_BUFFER);
+        sintable2[i] = sinf((i * FREQ2_CYCLES_PER_BUFFER * 2.0f * M_PI) /
+                            FRAMES_PER_BUFFER);
     }
 
     PaError err;
