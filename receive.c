@@ -12,6 +12,9 @@
 #define FREQ1_CYCLES_PER_BUFFER 0x40
 #define FREQ2_CYCLES_PER_BUFFER 0x60
 
+#define FREQ1_EQ 0.06f
+#define FREQ2_EQ 0.01f
+
 // Precomputed lookup tables of e^(-i 2 pi f t)
 float complex exptable1[FRAMES_PER_BUFFER];
 float complex exptable2[FRAMES_PER_BUFFER];
@@ -31,7 +34,7 @@ static int audio_callback(const void *inputBuffer, void *outputBuffer,
         ft1 += micInput[i] * exptable1[i];
         ft2 += micInput[i] * exptable2[i];
     }
-    float ft1_mag = cabsf(ft1), ft2_mag = cabsf(ft2);
+    float ft1_mag = cabsf(ft1) * FREQ1_EQ, ft2_mag = cabsf(ft2) * FREQ2_EQ;
     printf("%f %f\n", ft1_mag, ft2_mag);
     callback_data_t *user_data = (callback_data_t *)userData;
     user_data->callback_count++;
