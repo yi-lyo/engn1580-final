@@ -71,7 +71,7 @@
  * Window / chart geometry
  * ═══════════════════════════════════════════════════════════════════ */
 #define WIN_W     1130
-#define WIN_H      645   /* extra rows for timing/PLL/SNR/FEC indicators     */
+#define WIN_H      762   /* includes decoded-output panel at bottom           */
 
 #define CHART_X     50
 #define CHART_Y     46
@@ -85,6 +85,12 @@
 #define SYNC_Y   (CHART_Y + CHART_H + 60)   /* timing + PLL row             */
 #define STAT_Y   (CHART_Y + CHART_H + 86)   /* SNR / FEC / interference row */
 #define HINT_Y   (CHART_Y + CHART_H + 118)  /* keyboard hint                */
+
+/* ── Decoded output panel (full-width strip at the bottom) ─────── */
+#define OUTPUT_X   CHART_X                  /* left-aligned with FFT chart   */
+#define OUTPUT_W   (CHART_W + 30 + IQ_SIZE) /* spans both panels  (= 1030)   */
+#define OUTPUT_Y   (HINT_Y + 20)            /* below keyboard hint           */
+#define OUTPUT_H   (WIN_H - OUTPUT_Y - 10)  /* fills to window bottom (~148) */
 
 /* ── Timing / carrier-recovery parameters ─────────────────────────── */
 /*
@@ -422,6 +428,167 @@ static void render_iq_panel(SDL_Renderer *ren, TTF_Font *font,
                  sym_window == 0 ? "(boundary)" : "(safe)");
         draw_text(ren, font, tw_str,
                   IQ_X + 6, IQ_Y + IQ_SIZE - 34, tc);
+    }
+}
+
+/* ───────────────────────────────────────────────────────────────────
+ * render_frame
+ *
+ * render_decoded_output
+ *
+ * Draws the full-width "Decoded Output" strip at the bottom of the window.
+ * The panel updates live as symbols are decoded — each newly-decoded byte
+ * appears immediately, giving a typewriter-style streaming display.
+ *
+ * Layout
+ * ──────
+ *   Title bar  — "Decoded Output  [N bytes · M FEC corrections · status]"
+ *   Separator  — 1-px horizontal rule
+ *   Text area  — decoded bytes rendered as UTF-8 text; non-printable bytes
+ *                become a middle dot (·, U+00B7).  Lines are word-wrapped
+ *                at CHARS_PER_LINE bytes and the view always scrolls to show
+ *                the most recently decoded content.
+ *   Cursor     — a blinking block (▌) appended to the last line while the
+ *                receiver is in DECODING state.
+ *
+ * rx_state: 0 = WAITING, 1 = CALIBRATING, 2 = DECODING
+ * ─────────────────────────────────────────────────────────────────── */
+static void render_decoded_output(SDL_Renderer *ren, TTF_Font *font,
+                                   const char *text, int text_chars,
+                                   int byte_count, int corrections,
+                                   int fec_enabled, int rx_state)
+{
+    const int X          = OUTPUT_X;
+    const int Y          = OUTPUT_Y;
+    const int W          = OUTPUT_W;
+    const int H          = OUTPUT_H;
+    const int PAD_X      = 8;
+    const int PAD_Y      = 5;
+    const int LINE_H     = 15;          /* pixels per text row              */
+    const int TITLE_H    = 22;          /* pixels for the title row         */
+    const int SEP_Y      = Y + PAD_Y + TITLE_H;
+    const int CONTENT_Y  = SEP_Y + 5;
+    const int CONTENT_H  = H - (CONTENT_Y - Y) - 4;
+    const int MAX_LINES  = CONTENT_H / LINE_H;
+    /* Maximum bytes per display line.  At ~7 px/char and OUTPUT_W ≈ 1030 px
+     * the comfortable column count is around 128 characters.              */
+    const int COLS       = 128;
+
+    /* ── panel background ──────────────────────────────────────────── */
+    SDL_SetRenderDrawColor(ren, 6, 6, 14, 255);
+    SDL_Rect bg = {X, Y, W, H};
+    SDL_RenderFillRect(ren, &bg);
+
+    /* ── title ──────────────────────────────────────────────────────── */
+    {
+        const char *status_str =
+            rx_state == 0 ? "waiting for carrier" :
+            rx_state == 1 ? "calibrating…"        :
+                            "receiving";
+
+        char title[192];
+        if (fec_enabled && corrections > 0)
+            snprintf(title, sizeof(title),
+                     "Decoded Output  [%d byte%s  \xc2\xb7  "
+                     "%d FEC correction%s  \xc2\xb7  %s]",
+                     byte_count, byte_count == 1 ? "" : "s",
+                     corrections, corrections == 1 ? "" : "s",
+                     status_str);
+        else
+            snprintf(title, sizeof(title),
+                     "Decoded Output  [%d byte%s  \xc2\xb7  %s]",
+                     byte_count, byte_count == 1 ? "" : "s",
+                     status_str);
+
+        SDL_Color tc = {120, 120, 160, 255};
+        draw_text(ren, font, title, X + PAD_X, Y + PAD_Y, tc);
+    }
+
+    /* ── separator ──────────────────────────────────────────────────── */
+    SDL_SetRenderDrawColor(ren, 38, 38, 65, 255);
+    SDL_RenderDrawLine(ren, X + 4, SEP_Y, X + W - 4, SEP_Y);
+
+    /* ── border ─────────────────────────────────────────────────────── */
+    SDL_SetRenderDrawColor(ren, 55, 55, 90, 255);
+    SDL_RenderDrawRect(ren, &bg);
+
+    /* ── placeholder when nothing has been decoded yet ──────────────── */
+    if (byte_count == 0 || text_chars == 0) {
+        const char *hint =
+            rx_state == 0 ? "Waiting for carrier\xe2\x80\xa6" :
+            rx_state == 1 ? "Calibrating phase reference\xe2\x80\xa6" :
+                            "Receiving\xe2\x80\xa6";
+        SDL_Color hc = {50, 50, 80, 255};
+        draw_text(ren, font, hint, X + PAD_X, CONTENT_Y, hc);
+        return;
+    }
+
+    /* ── split preview text into display lines ───────────────────────
+     * We iterate byte-by-byte, counting visual characters (middle-dot
+     * sequences 0xC2 0xB7 count as one column each).  A new line begins
+     * when a '\n' is encountered or when the column count reaches COLS.
+     * We keep at most 256 line descriptors and render the last MAX_LINES.
+     */
+    typedef struct { const char *start; size_t bytes; } LineSpan;
+    LineSpan spans[256];
+    int n_spans = 0;
+
+    const char *p          = text;
+    const char *line_start = p;
+    int         col        = 0;
+
+    while (*p && n_spans < 255) {
+        unsigned char c = (unsigned char)*p;
+
+        /* Middle dot: U+00B7, encoded as 0xC2 0xB7 — counts as 1 column */
+        int is_dot = (c == 0xC2 && (unsigned char)*(p+1) == 0xB7);
+        int advance = is_dot ? 2 : 1;
+
+        if (c == '\n' || col >= COLS) {
+            spans[n_spans].start = line_start;
+            spans[n_spans].bytes = (size_t)(p - line_start);
+            n_spans++;
+            if (c == '\n') p++;
+            line_start = p;
+            col = 0;
+            continue;
+        }
+
+        p   += advance;
+        col += 1;
+    }
+    /* Capture the final partial line */
+    if (p > line_start && n_spans < 256) {
+        spans[n_spans].start = line_start;
+        spans[n_spans].bytes = (size_t)(p - line_start);
+        n_spans++;
+    }
+
+    /* ── blinking cursor appended to the last line while decoding ────── */
+    int show_cursor = (rx_state == 2) &&
+                      (((int)(SDL_GetTicks() / 400)) % 2 == 0);
+
+    /* ── render the last MAX_LINES spans ────────────────────────────── */
+    int first = n_spans - MAX_LINES;
+    if (first < 0) first = 0;
+
+    SDL_Color text_col = {190, 200, 185, 255};
+
+    for (int li = first; li < n_spans; li++) {
+        /* Copy the span into a NUL-terminated buffer */
+        char line_buf[COLS * 3 + 8];   /* ×3 for UTF-8, +8 for cursor   */
+        size_t blen = spans[li].bytes;
+        if (blen >= sizeof(line_buf) - 4) blen = sizeof(line_buf) - 4;
+        memcpy(line_buf, spans[li].start, blen);
+        line_buf[blen] = '\0';
+
+        /* Append cursor glyph to the very last line */
+        if (li == n_spans - 1 && show_cursor)
+            /* U+258C LEFT HALF BLOCK, UTF-8: 0xE2 0x96 0x8C */
+            strncat(line_buf, "\xe2\x96\x8c", sizeof(line_buf) - blen - 1);
+
+        int row_y = CONTENT_Y + (li - first) * LINE_H;
+        draw_text(ren, font, line_buf, X + PAD_X, row_y, text_col);
     }
 }
 
@@ -1173,6 +1340,35 @@ int main(int argc, char *argv[])
          * deinterleaves + Hamming-decodes when the carrier drops.  */
         uint8_t *fec_sym_buf     = NULL;   /* grows as symbols arrive  */
         size_t   fec_sym_cap     = 0;
+        size_t   fec_sym_bits    = 0;      /* exact bit count (NOT fec_sym_len*8)
+                                            * fec_sym_len rounds UP to bytes so
+                                            * using it as the next-bit position
+                                            * would skip bits 2-7 of every byte */
+        int      prev_timing_locked = 0;   /* detect the first timing-lock edge */
+
+        /* ── Decoded-output live preview ───────────────────────────
+         *
+         * preview_buf holds the printable representation of every byte
+         * decoded so far in the current transmission.  It is rebuilt
+         * from fec_sym_buf on each frame that carries new data.
+         *
+         * Non-printable bytes → middle dot  (·, U+00B7, 0xC2 0xB7).
+         * '\n' and '\t' are preserved literally so formatted text looks
+         * natural in the panel.
+         *
+         * For FEC mode psk_fec_decode() is called on the full
+         * accumulated buffer; only complete interleave blocks are
+         * returned, so the display shows partial-but-correct output as
+         * the transmission progresses.
+         */
+#define PREVIEW_MAX 8192
+        char   preview_buf[PREVIEW_MAX + 4];  /* +4: cursor glyph headroom */
+        int    preview_chars    = 0;
+        int    preview_bytes    = 0;
+        int    preview_corr     = 0;
+        size_t preview_src_len  = 0;   /* fec_sym_len at last rebuild  */
+        int    prev_rx_state    = 0;
+        memset(preview_buf, 0, sizeof(preview_buf));
         size_t   fec_sym_len     = 0;      /* bytes used               */
         int      fec_corrections = 0;      /* running correction count */
 
@@ -1233,6 +1429,10 @@ int main(int argc, char *argv[])
                      fec_enabled, fec_corrections, fec_depth);
         render_iq_panel(ren, font, iq_hist, iq_head, iq_count,
                         M, current_sym, rx_state, timing_locked, sym_window);
+        render_decoded_output(ren, font,
+                               preview_buf, preview_chars,
+                               preview_bytes, preview_corr,
+                               fec_enabled, rx_state);
         SDL_RenderPresent(ren);
 
         int running = 1;
@@ -1269,6 +1469,8 @@ int main(int argc, char *argv[])
 
             /* ── compute full FFT (for display) ─────────────────── */
             compute_dft(local_samples, FRAMES_PER_BUFFER, magnitudes);
+
+
 
             /* ── channel quality estimates ──────────────────────── */
             snr_db     = psk_snr_estimate_db(magnitudes, BAR_WIDTH,
@@ -1336,6 +1538,33 @@ int main(int argc, char *argv[])
                 ft_prev_re = local_ft_re;
                 ft_prev_im = local_ft_im;
             }
+
+            /* ── Reset accumulator on first timing lock ───────────
+             *
+             * Before timing_locked becomes 1 the accumulator samples
+             * every post-calibration window, including the remaining
+             * preamble windows.  Those preamble bits land at a
+             * non-byte-aligned position (9 windows × 2 bits = 18 bits
+             * for QPSK) which corrupts every output byte.
+             *
+             * When the first symbol boundary is detected (preamble →
+             * first data symbol), we discard those preamble bits by
+             * zeroing the accumulator.  Subsequent data bits then start
+             * at position 0, cleanly byte-aligned.
+             */
+            if (timing_locked && !prev_timing_locked) {
+                fec_sym_len  = 0;
+                fec_sym_bits = 0;
+                if (fec_sym_buf) memset(fec_sym_buf, 0, fec_sym_cap);
+
+                /* Reset live preview too so preamble zeros don't show */
+                preview_chars   = 0;
+                preview_bytes   = 0;
+                preview_corr    = 0;
+                preview_src_len = 0;
+                memset(preview_buf, 0, sizeof(preview_buf));
+            }
+            prev_timing_locked = timing_locked;
 
             /* ═══════════════════════════════════════════════════════
              * CARRIER STATE MACHINE  (WAITING → CALIBRATING → DECODING)
@@ -1455,22 +1684,34 @@ int main(int argc, char *argv[])
                 is_boundary = 0;
             }
 
-            /* ── Symbol accumulator (always-on) ──────────────────────
+            /* ── Symbol accumulator ───────────────────────────────────
              *
-             * Regardless of whether FEC is enabled, decoded symbol bits
-             * are packed into fec_sym_buf as a running bitstream.
+             * Decoded symbol bits are packed into fec_sym_buf as a
+             * running bitstream used for both the live preview and the
+             * final file/stderr output.
              *
-             * When FEC is enabled  → buf contains FEC-encoded bits;
-             *   psk_fec_decode() recovers the original data.
-             * When FEC is disabled → buf contains raw data bits;
-             *   the buffer is written directly as bytes.
-             *
-             * Output is written to the file named by -o (if given) or
-             * printed to stderr as a text preview when carrier drops.
+             * Guard conditions (all must be true):
+             *   rx_state == 2          — in DECODING state
+             *   !is_boundary           — not a symbol-boundary window
+             *   carrier_mag > threshold— carrier is present (prevents
+             *                           stale current_bits from being
+             *                           accumulated after the carrier
+             *                           drops, which caused the repeated
+             *                           "Decoded 1 byte" spam)
+             *   !timing_locked ||      — before timing locks, take all
+             *   sym_window == 2        — after timing locks, take only
+             *                           the middle window (window 2 of
+             *                           the 4-window cycle).  Without
+             *                           this gate every symbol was
+             *                           sampled 3 times, tripling the
+             *                           bit count and corrupting the
+             *                           recovered bytes.
              */
-            if (rx_state == 2 && !is_boundary) {
+            if (rx_state == 2 && !is_boundary
+                && carrier_mag > SIG_THRESHOLD
+                && (!timing_locked || sym_window == 2)) {
                 int    bps      = ilog2(M);
-                size_t bits_now = fec_sym_len * 8;
+                size_t bits_now = fec_sym_bits;   /* exact bit position */
 
                 /* Grow buffer on demand */
                 if (bits_now + (size_t)bps > fec_sym_cap * 8) {
@@ -1483,13 +1724,18 @@ int main(int argc, char *argv[])
                     }
                 }
                 if (fec_sym_buf) {
-                    /* Append bps bits of current_bits MSB-first */
+                    /* Append bps bits of current_bits MSB-first.
+                     * IMPORTANT: bits_now starts from fec_sym_bits, NOT
+                     * fec_sym_len*8.  fec_sym_len is ceil(bits/8) so
+                     * restarting from it would skip bits 2-7 of each
+                     * partial byte, producing garbled output. */
                     for (int b = bps - 1; b >= 0; b--) {
                         psk_setbit(fec_sym_buf, bits_now,
                                    (current_bits >> b) & 1);
                         bits_now++;
                     }
-                    fec_sym_len = (bits_now + 7) / 8;
+                    fec_sym_bits = bits_now;
+                    fec_sym_len  = (bits_now + 7) / 8;
                 }
             }
 
@@ -1539,7 +1785,88 @@ int main(int argc, char *argv[])
                     free(dec);
                 }
 
-                fec_sym_len = 0;   /* reset for next transmission */
+                fec_sym_len        = 0;
+                fec_sym_bits       = 0;   /* reset for next transmission */
+                prev_timing_locked = 0;   /* allow re-lock on next preamble */
+            }
+
+            /* ── live preview rebuild ──────────────────────────────
+             *
+             * Rebuild the decoded-output preview whenever the symbol
+             * accumulator has grown since the last frame.  For non-FEC
+             * mode fec_sym_buf already contains raw decoded bytes, so
+             * we read them directly.  For FEC mode we run psk_fec_decode
+             * on the full buffer; only complete interleave blocks are
+             * returned, which avoids displaying garbled partial output.
+             *
+             * The preview is cleared when rx_state transitions from
+             * WAITING (0) to CALIBRATING (1), i.e. a new carrier appears
+             * and a fresh transmission is starting.
+             */
+            if (prev_rx_state == 0 && rx_state == 1) {
+                /* New transmission: reset preview */
+                preview_chars   = 0;
+                preview_bytes   = 0;
+                preview_corr    = 0;
+                preview_src_len = 0;
+                memset(preview_buf, 0, sizeof(preview_buf));
+            }
+            prev_rx_state = rx_state;
+
+            if (fec_sym_len != preview_src_len && fec_sym_len > 0) {
+                preview_src_len = fec_sym_len;
+
+                /* Obtain the source bytes */
+                const uint8_t *src     = NULL;
+                size_t         src_len = 0;
+                uint8_t       *fec_dec = NULL;
+
+                if (fec_enabled) {
+                    int    corr    = 0;
+                    size_t dec_len = 0;
+                    fec_dec = psk_fec_decode(fec_sym_buf, fec_sym_len,
+                                             fec_depth, &dec_len, &corr);
+                    if (fec_dec) {
+                        src     = fec_dec;
+                        src_len = dec_len;
+                        preview_corr = corr;
+                    }
+                } else {
+                    src     = fec_sym_buf;
+                    src_len = fec_sym_len;
+                }
+
+                /* Convert bytes to display characters */
+                if (src && src_len > 0) {
+                    preview_chars = 0;
+                    preview_bytes = (int)src_len;
+                    memset(preview_buf, 0, sizeof(preview_buf));
+
+                    for (size_t bi = 0;
+                         bi < src_len && preview_chars < PREVIEW_MAX - 2;
+                         bi++) {
+                        unsigned char b = src[bi];
+                        if (b >= 0x20 && b < 0x7F) {
+                            /* Plain printable ASCII */
+                            preview_buf[preview_chars++] = (char)b;
+                        } else if (b == '\n' || b == '\r') {
+                            preview_buf[preview_chars++] = '\n';
+                        } else if (b == '\t') {
+                            /* Expand tab to four spaces */
+                            for (int sp = 0;
+                                 sp < 4 && preview_chars < PREVIEW_MAX - 2;
+                                 sp++)
+                                preview_buf[preview_chars++] = ' ';
+                        } else {
+                            /* Non-printable → middle dot (U+00B7) */
+                            preview_buf[preview_chars++] = '\xc2';
+                            preview_buf[preview_chars++] = '\xb7';
+                        }
+                    }
+                    preview_buf[preview_chars] = '\0';
+                }
+
+                if (fec_dec) free(fec_dec);
             }
 
             /* ── render both panels, then present ───────────────── */
@@ -1554,6 +1881,11 @@ int main(int argc, char *argv[])
             render_iq_panel(ren, font, iq_hist, iq_head, iq_count,
                             M, current_sym, rx_state,
                             timing_locked, sym_window);
+
+            render_decoded_output(ren, font,
+                                   preview_buf, preview_chars,
+                                   preview_bytes, preview_corr,
+                                   fec_enabled, rx_state);
 
             SDL_RenderPresent(ren);
         }
