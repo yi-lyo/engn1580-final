@@ -59,6 +59,7 @@
 #include <complex.h>
 #include <math.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -108,6 +109,14 @@
  *   Time constant ≈ 1/α frames ≈ 40 frames ≈ 3.4 s at 12 Hz.
  */
 #define PSK_PLL_ALPHA       0.025f
+
+/*
+ * PSK_AGC_ALPHA
+ *   Smoothing gain for the exponential AGC amplitude tracker.
+ *   agc_mag = α·|ft| + (1−α)·agc_mag
+ *   Time constant ≈ 1/α frames ≈ 1.4 s at 12 Hz.
+ */
+#define PSK_AGC_ALPHA       0.05f
 
 /* ═══════════════════════════════════════════════════════════════════
  * 3. Utility
@@ -190,7 +199,7 @@ static inline uint8_t *psk_bytes_to_symbols(const uint8_t *data,
 {
     size_t   total_bits = data_len * 8;
     size_t   n_syms     = (total_bits + (size_t)bps - 1) / (size_t)bps;
-    uint8_t *syms       = calloc(n_syms, 1);
+    uint8_t *syms       = (uint8_t *)calloc(n_syms, 1);
     if (!syms) return NULL;
 
     for (size_t s = 0; s < n_syms; s++) {
@@ -230,7 +239,7 @@ static inline uint8_t *psk_symbols_to_bytes(const uint8_t *syms,
 {
     size_t   total_bits = n_syms * (size_t)bps;
     size_t   n_bytes    = total_bits / 8;
-    uint8_t *bytes      = calloc(n_bytes, 1);
+    uint8_t *bytes      = (uint8_t *)calloc(n_bytes, 1);
     if (!bytes) return NULL;
 
     for (size_t s = 0; s < n_syms; s++) {
@@ -361,6 +370,7 @@ typedef struct {
     float pll_error_deg;   /* PLL phase error in degrees            */
     float carrier_mag;     /* |DFT[CARRIER_BIN]| from last window   */
     float carrier_phase_deg; /* raw received phase in degrees       */
+    float agc_mag;         /* AGC: exponentially-smoothed |ft|      */
 
     /* ── Timing recovery ────────────────────────────────────── */
     int   sym_window;      /* position in 4-window cycle; -1=none  */
@@ -413,6 +423,10 @@ static inline int psk_rx_process_window(PskRxState  *s,
 
     s->carrier_mag       = mag;
     s->carrier_phase_deg = phi * 180.0f / (float)M_PI;
+
+    /* AGC: long-term amplitude envelope (decays slowly during silence) */
+    s->agc_mag = PSK_AGC_ALPHA * mag
+               + (1.0f - PSK_AGC_ALPHA) * s->agc_mag;
 
     /* ── Step 2: Timing recovery ─────────────────────────────
      *
@@ -510,6 +524,427 @@ static inline int psk_rx_process_window(PskRxState  *s,
     }
 
     return -1;   /* no symbol decision this window */
+}
+
+/* ═══════════════════════════════════════════════════════════════════
+ * 10. Hamming(7,4) Forward Error Correction
+ *
+ * Encodes 4 data bits (a nibble) into a 7-bit codeword with 3
+ * parity bits.  Any single-bit error is correctable via a 3-bit
+ * syndrome that encodes the error position (1-indexed) in binary.
+ *
+ * Bit layout in the uint8_t codeword (bit 6 = MSB, bit 0 = LSB):
+ *   [6]=d4  [5]=d3  [4]=d2  [3]=p3  [2]=d1  [1]=p2  [0]=p1
+ *
+ * Parity equations (positions 1,2,4 are parity; 3,5,6,7 are data):
+ *   p1 = d1^d2^d4   (positions 1,3,5,7)
+ *   p2 = d1^d3^d4   (positions 2,3,6,7)
+ *   p3 = d2^d3^d4   (positions 4,5,6,7)
+ *
+ * Rate: 4/7 ≈ 57%.  Paired with Gray coding and block interleaving,
+ * a burst of ≤ depth consecutive bit errors (one per codeword) is
+ * fully correctable.
+ * ═══════════════════════════════════════════════════════════════════ */
+
+#define PSK_HAMMING_K           4    /* data bits per codeword              */
+#define PSK_HAMMING_N           7    /* total bits per codeword             */
+#define PSK_DEFAULT_ILVE_DEPTH  8    /* default interleave depth (codewords)*/
+
+/* ── Bit-stream helpers (MSB-first within each byte) ────────────── */
+static inline int psk_getbit(const uint8_t *a, size_t i)
+{
+    return (a[i / 8] >> (7 - (int)(i % 8))) & 1;
+}
+static inline void psk_setbit(uint8_t *a, size_t i, int bit)
+{
+    int shift = 7 - (int)(i % 8);
+    if (bit) a[i / 8] |=  (uint8_t)(1u << shift);
+    else     a[i / 8] &= (uint8_t)~(1u << shift);
+}
+
+/*
+ * psk_hamming_encode
+ * nibble: bits [3:0] = d4 d3 d2 d1.  Returns 7-bit codeword.
+ */
+static inline uint8_t psk_hamming_encode(uint8_t nibble)
+{
+    int d1 = (nibble >> 0) & 1;
+    int d2 = (nibble >> 1) & 1;
+    int d3 = (nibble >> 2) & 1;
+    int d4 = (nibble >> 3) & 1;
+    int p1 = d1 ^ d2 ^ d4;
+    int p2 = d1 ^ d3 ^ d4;
+    int p3 = d2 ^ d3 ^ d4;
+    return (uint8_t)((d4<<6)|(d3<<5)|(d2<<4)|(p3<<3)|(d1<<2)|(p2<<1)|p1);
+}
+
+/*
+ * psk_hamming_decode
+ * Corrects up to 1 bit in codeword and writes data nibble to *nibble_out.
+ * Returns 0 = no error, 1 = corrected.
+ */
+static inline int psk_hamming_decode(uint8_t codeword, uint8_t *nibble_out)
+{
+    int r1 = (codeword >> 0) & 1;
+    int r2 = (codeword >> 1) & 1;
+    int r3 = (codeword >> 2) & 1;
+    int r4 = (codeword >> 3) & 1;
+    int r5 = (codeword >> 4) & 1;
+    int r6 = (codeword >> 5) & 1;
+    int r7 = (codeword >> 6) & 1;
+
+    int s1  = r1 ^ r3 ^ r5 ^ r7;
+    int s2  = r2 ^ r3 ^ r6 ^ r7;
+    int s3  = r4 ^ r5 ^ r6 ^ r7;
+    int syn = s1 | (s2 << 1) | (s3 << 2);
+
+    int status = 0;
+    if (syn) {
+        codeword ^= (uint8_t)(1u << (syn - 1));
+        r3 = (codeword >> 2) & 1;
+        r5 = (codeword >> 4) & 1;
+        r6 = (codeword >> 5) & 1;
+        r7 = (codeword >> 6) & 1;
+        status = 1;
+    }
+    *nibble_out = (uint8_t)((r7<<3)|(r6<<2)|(r5<<1)|r3);
+    return status;
+}
+
+/* ═══════════════════════════════════════════════════════════════════
+ * 11. Full FEC encode / decode (Hamming + block interleaving)
+ *
+ * Encode pipeline:
+ *   bytes → bits → nibbles → Hamming(7,4) codewords
+ *        → block-interleave → pack to bytes
+ *
+ * Decode pipeline (inverse):
+ *   bytes → bits → block-deinterleave → 7-bit groups
+ *        → Hamming decode → nibbles → bytes
+ *
+ * Block interleaver (depth D codewords per block):
+ *   Writes a D-row × 7-column matrix row-by-row (codeword bits across
+ *   columns) and reads it column-by-column for transmission.
+ *   A burst of ≤ D consecutive corrupted transmitted bits hits at most
+ *   1 bit per codeword, which Hamming corrects independently.
+ *
+ *   interleave:   output[j] = input[(j % D) × W  +  j / D]  where W = n/D
+ *   deinterleave: output[(i % W) × D  +  i / W] = input[i]
+ * ═══════════════════════════════════════════════════════════════════ */
+
+/*
+ * psk_fec_encode
+ *   data / data_len  — raw input bytes
+ *   depth            — interleave depth in codewords (≥ 1)
+ *   out_len          — set to encoded byte count
+ * Returns calloc-allocated buffer; caller must free().
+ * Input is zero-padded to a multiple of 4 bits then to a multiple of
+ * depth codewords for clean block alignment.
+ */
+static inline uint8_t *psk_fec_encode(const uint8_t *data, size_t data_len,
+                                       int depth, size_t *out_len)
+{
+    *out_len = 0;
+    if (!data || data_len == 0) return (uint8_t *)calloc(1, 1);
+
+    size_t D         = (depth > 0) ? (size_t)depth : 1;
+    size_t n_nib     = (data_len * 8 + 3) / 4;
+    size_t rem       = n_nib % D;
+    if (rem) n_nib  += D - rem;                    /* pad to multiple of D */
+
+    size_t n_enc_bits  = n_nib * (size_t)PSK_HAMMING_N;
+    size_t n_out_bytes = (n_enc_bits + 7) / 8;
+    uint8_t *enc = (uint8_t *)calloc(n_out_bytes, 1);
+    if (!enc) return NULL;
+
+    /* Hamming encode each nibble */
+    size_t n_in_bits = data_len * 8;
+    for (size_t cw = 0; cw < n_nib; cw++) {
+        uint8_t nibble = 0;
+        for (int b = 0; b < PSK_HAMMING_K; b++) {
+            size_t idx = cw * (size_t)PSK_HAMMING_K + (size_t)b;
+            int    bit = (idx < n_in_bits) ? psk_getbit(data, idx) : 0;
+            nibble |= (uint8_t)(bit << b);
+        }
+        uint8_t cw_byte = psk_hamming_encode(nibble);
+        for (int b = 0; b < PSK_HAMMING_N; b++)
+            psk_setbit(enc, cw * (size_t)PSK_HAMMING_N + (size_t)b,
+                       (cw_byte >> b) & 1);
+    }
+
+    /* Block interleave: transpose D-row × 7-col blocks */
+    if (D > 1) {
+        size_t block_bits = D * (size_t)PSK_HAMMING_N;
+        size_t n_blocks   = n_nib / D;
+        uint8_t *tmp = (uint8_t *)calloc(n_out_bytes, 1);
+        if (tmp) {
+            for (size_t blk = 0; blk < n_blocks; blk++) {
+                size_t base = blk * block_bits;
+                for (size_t row = 0; row < D; row++)
+                    for (int col = 0; col < PSK_HAMMING_N; col++)
+                        psk_setbit(tmp,
+                            base + (size_t)col * D + row,
+                            psk_getbit(enc,
+                                base + row * (size_t)PSK_HAMMING_N
+                                     + (size_t)col));
+            }
+            memcpy(enc, tmp, n_out_bytes);
+            free(tmp);
+        }
+    }
+
+    *out_len = n_out_bytes;
+    return enc;
+}
+
+/*
+ * psk_fec_decode
+ *   encoded / enc_len  — FEC-encoded bytes
+ *   depth              — must match encoder
+ *   out_len            — set to decoded byte count
+ *   corrections_out    — if non-NULL, set to number of bits corrected
+ * Returns calloc-allocated buffer; caller must free().
+ */
+static inline uint8_t *psk_fec_decode(const uint8_t *encoded, size_t enc_len,
+                                       int depth, size_t *out_len,
+                                       int *corrections_out)
+{
+    *out_len = 0;
+    if (corrections_out) *corrections_out = 0;
+    if (!encoded || enc_len == 0) return (uint8_t *)calloc(1, 1);
+
+    size_t D           = (depth > 0) ? (size_t)depth : 1;
+    size_t n_codewords = (enc_len * 8) / (size_t)PSK_HAMMING_N;
+    if (!n_codewords) return (uint8_t *)calloc(1, 1);
+
+    size_t n_enc_bits  = n_codewords * (size_t)PSK_HAMMING_N;
+    size_t n_enc_bytes = (n_enc_bits + 7) / 8;
+    uint8_t *work = (uint8_t *)calloc(n_enc_bytes, 1);
+    if (!work) return NULL;
+    memcpy(work, encoded, enc_len < n_enc_bytes ? enc_len : n_enc_bytes);
+
+    /* Block deinterleave (inverse transpose) */
+    if (D > 1 && n_codewords >= D) {
+        size_t block_bits = D * (size_t)PSK_HAMMING_N;
+        size_t n_blocks   = n_codewords / D;
+        uint8_t *tmp = (uint8_t *)calloc(n_enc_bytes, 1);
+        if (tmp) {
+            for (size_t blk = 0; blk < n_blocks; blk++) {
+                size_t base = blk * block_bits;
+                for (int col = 0; col < PSK_HAMMING_N; col++)
+                    for (size_t row = 0; row < D; row++)
+                        psk_setbit(tmp,
+                            base + row * (size_t)PSK_HAMMING_N + (size_t)col,
+                            psk_getbit(work,
+                                base + (size_t)col * D + row));
+            }
+            memcpy(work, tmp, n_enc_bytes);
+            free(tmp);
+        }
+    }
+
+    /* Hamming decode */
+    size_t n_out_bits  = n_codewords * (size_t)PSK_HAMMING_K;
+    size_t n_out_bytes = (n_out_bits + 7) / 8;
+    uint8_t *out = (uint8_t *)calloc(n_out_bytes, 1);
+    if (!out) { free(work); return NULL; }
+
+    int corrections = 0;
+    for (size_t cw = 0; cw < n_codewords; cw++) {
+        uint8_t cw_byte = 0;
+        for (int b = 0; b < PSK_HAMMING_N; b++)
+            if (psk_getbit(work, cw * (size_t)PSK_HAMMING_N + (size_t)b))
+                cw_byte |= (uint8_t)(1u << b);
+
+        uint8_t nibble;
+        corrections += psk_hamming_decode(cw_byte, &nibble);
+
+        for (int b = 0; b < PSK_HAMMING_K; b++) {
+            size_t oi = cw * (size_t)PSK_HAMMING_K + (size_t)b;
+            if (oi < n_out_bits)
+                psk_setbit(out, oi, (nibble >> b) & 1);
+        }
+    }
+
+    free(work);
+    if (corrections_out) *corrections_out = corrections;
+    *out_len = n_out_bytes;
+    return out;
+}
+
+/* ═══════════════════════════════════════════════════════════════════
+ * 12. Channel-quality estimation: SNR, interference, AGC
+ *
+ * SNR estimate
+ * ────────────
+ *   SNR_dB = 10·log10( carrier_power / mean_noise_power )
+ *
+ *   carrier_power = magnitudes[carrier_bin]²
+ *   noise_floor   = mean of magnitudes[k]² for |k−carrier_bin| > GUARD
+ *
+ * Interference detection
+ * ──────────────────────
+ *   A non-carrier bin k is flagged when
+ *   magnitudes[k] > PSK_INTF_RATIO × magnitudes[carrier_bin].
+ *   Signals with a high carrier-to-interference ratio may corrupt the
+ *   DFT phase and bypass the PLL's ability to track the true carrier.
+ *
+ * AGC (Automatic Gain Control)
+ * ────────────────────────────
+ *   agc_mag = α·|ft| + (1−α)·agc_mag   (updated in psk_rx_process_window)
+ *   Provides a slow-moving estimate of the received signal level that
+ *   is independent of symbol timing.  The receiver can use this to
+ *   normalise the IQ diagram and to detect signal presence without
+ *   relying solely on the instantaneous |ft|.
+ * ═══════════════════════════════════════════════════════════════════ */
+
+#define PSK_SNR_GUARD    2       /* bins excluded around carrier for noise   */
+#define PSK_INTF_RATIO   0.5f   /* interferer threshold: > 50% of carrier   */
+
+/*
+ * psk_snr_estimate_db
+ * Returns estimated SNR in dB from the BAR_WIDTH-bin magnitude array.
+ * Returns -60.0 when the carrier is below the noise floor.
+ */
+static inline float psk_snr_estimate_db(const float *magnitudes,
+                                         int n_bins, int carrier_bin)
+{
+    float sig2      = magnitudes[carrier_bin] * magnitudes[carrier_bin];
+    float noise_sum = 0.0f;
+    int   noise_cnt = 0;
+
+    for (int k = 0; k < n_bins; k++) {
+        int dist = k - carrier_bin;
+        if (dist < 0) dist = -dist;
+        if (dist <= PSK_SNR_GUARD) continue;
+        noise_sum += magnitudes[k] * magnitudes[k];
+        noise_cnt++;
+    }
+
+    if (sig2 < 1e-20f) return -60.0f;
+    if (noise_cnt == 0 || noise_sum < 1e-20f) return  60.0f;
+    float noise_avg = noise_sum / (float)noise_cnt;
+    return 10.0f * log10f(sig2 / noise_avg);
+}
+
+/*
+ * psk_detect_interference
+ * Returns 1 if any bin outside the guard zone exceeds
+ * PSK_INTF_RATIO × carrier magnitude.
+ * Writes the strongest interferer's bin index to *intf_bin_out
+ * (left unchanged when no interference found).
+ */
+static inline int psk_detect_interference(const float *magnitudes,
+                                           int n_bins, int carrier_bin,
+                                           int *intf_bin_out)
+{
+    float threshold = PSK_INTF_RATIO * magnitudes[carrier_bin];
+    float max_mag   = 0.0f;
+    int   max_bin   = -1;
+
+    for (int k = 0; k < n_bins; k++) {
+        int dist = k - carrier_bin;
+        if (dist < 0) dist = -dist;
+        if (dist <= PSK_SNR_GUARD) continue;
+        if (magnitudes[k] > threshold && magnitudes[k] > max_mag) {
+            max_mag = magnitudes[k];
+            max_bin = k;
+        }
+    }
+
+    if (max_bin >= 0) {
+        if (intf_bin_out) *intf_bin_out = max_bin;
+        return 1;
+    }
+    return 0;
+}
+
+/* ═══════════════════════════════════════════════════════════════════
+ * 13. File I/O helpers
+ *
+ * These three functions provide a uniform interface for reading and
+ * writing binary data to/from files or streams, shared by transmit.c,
+ * receive.c, and test.c.
+ *
+ * psk_read_stream  — drain an open FILE* into a heap buffer.
+ * psk_read_file    — open a path, drain it, close it.
+ * psk_write_file   — open a path for writing, write all bytes, close.
+ *
+ * All returned buffers must be freed by the caller.
+ * ═══════════════════════════════════════════════════════════════════ */
+
+/*
+ * psk_read_stream
+ *
+ * Read all remaining bytes from the open stream `fp` into a
+ * calloc-allocated buffer.  Sets *out_len to the number of bytes read.
+ * Returns NULL on allocation failure (errno is set by malloc/realloc).
+ */
+static inline uint8_t *psk_read_stream(FILE *fp, size_t *out_len)
+{
+    size_t   cap = 4096, len = 0;
+    uint8_t *buf = (uint8_t *)malloc(cap);
+    if (!buf) { *out_len = 0; return NULL; }
+
+    int c;
+    while ((c = fgetc(fp)) != EOF) {
+        if (len == cap) {
+            uint8_t *tmp = (uint8_t *)realloc(buf, cap *= 2);
+            if (!tmp) { free(buf); *out_len = 0; return NULL; }
+            buf = tmp;
+        }
+        buf[len++] = (uint8_t)c;
+    }
+    *out_len = len;
+    return buf;
+}
+
+/*
+ * psk_read_file
+ *
+ * Open the file at `path` in binary read mode, read its entire
+ * contents into a heap buffer, close the file, and return the buffer.
+ * Sets *out_len to the number of bytes read.
+ * Returns NULL and prints an error to stderr on failure.
+ */
+static inline uint8_t *psk_read_file(const char *path, size_t *out_len)
+{
+    *out_len = 0;
+    FILE *fp = fopen(path, "rb");
+    if (!fp) {
+        fprintf(stderr, "Error: cannot open '%s' for reading.\n", path);
+        return NULL;
+    }
+    uint8_t *buf = psk_read_stream(fp, out_len);
+    fclose(fp);
+    if (!buf)
+        fprintf(stderr, "Error: allocation failed reading '%s'.\n", path);
+    return buf;
+}
+
+/*
+ * psk_write_file
+ *
+ * Write `len` bytes from `data` to the file at `path` (binary mode,
+ * creates or truncates).  Returns 0 on success, -1 on failure (error
+ * printed to stderr).
+ */
+static inline int psk_write_file(const char *path,
+                                  const uint8_t *data, size_t len)
+{
+    FILE *fp = fopen(path, "wb");
+    if (!fp) {
+        fprintf(stderr, "Error: cannot open '%s' for writing.\n", path);
+        return -1;
+    }
+    size_t written = fwrite(data, 1, len, fp);
+    fclose(fp);
+    if (written != len) {
+        fprintf(stderr, "Error: wrote %zu of %zu bytes to '%s'.\n",
+                written, len, path);
+        return -1;
+    }
+    return 0;
 }
 
 #endif /* PSK_COMMON_H */

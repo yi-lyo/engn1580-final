@@ -41,6 +41,8 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "psk_common.h"
+
 /* ═══════════════════════════════════════════════════════════════════
  * Timing / carrier constants
  * ═══════════════════════════════════════════════════════════════════ */
@@ -179,38 +181,27 @@ static int audio_callback(const void *inputBuffer, void *outputBuffer,
     return paContinue;
 }
 
-/* ═══════════════════════════════════════════════════════════════════
- * read_stdin — read all of stdin into a heap buffer
- * ═══════════════════════════════════════════════════════════════════ */
-static uint8_t *read_stdin(size_t *out_len)
-{
-    size_t   cap = 4096, len = 0;
-    uint8_t *buf = malloc(cap);
-    if (!buf) return NULL;
 
-    int c;
-    while ((c = getchar()) != EOF) {
-        if (len == cap) {
-            uint8_t *tmp = realloc(buf, cap *= 2);
-            if (!tmp) { free(buf); return NULL; }
-            buf = tmp;
-        }
-        buf[len++] = (uint8_t)c;
-    }
-    *out_len = len;
-    return buf;
-}
 
 /* ═══════════════════════════════════════════════════════════════════
  * main
  * ═══════════════════════════════════════════════════════════════════ */
 int main(int argc, char *argv[])
 {
-    /* ── parse -m M ───────────────────────────────────────────────── */
-    int M = 4;   /* default: QPSK */
+    /* ── parse arguments ──────────────────────────────────────────── */
+    int         M          = 4;    /* default: QPSK                   */
+    int         fec        = 0;    /* FEC disabled by default         */
+    int         depth      = PSK_DEFAULT_ILVE_DEPTH;
+    const char *input_file = NULL; /* NULL → read from stdin          */
 
     for (int a = 1; a < argc; a++) {
-        if (strcmp(argv[a], "-m") == 0) {
+        if (strcmp(argv[a], "-i") == 0) {
+            if (a + 1 >= argc) {
+                fprintf(stderr, "Error: -i requires a filename.\n");
+                return 1;
+            }
+            input_file = argv[++a];
+        } else if (strcmp(argv[a], "-m") == 0) {
             if (a + 1 >= argc) {
                 fprintf(stderr, "Error: -m requires an argument.\n");
                 return 1;
@@ -223,10 +214,23 @@ int main(int argc, char *argv[])
                     M);
                 return 1;
             }
+        } else if (strcmp(argv[a], "-e") == 0) {
+            fec = 1;
+        } else if (strcmp(argv[a], "-d") == 0) {
+            if (a + 1 >= argc) {
+                fprintf(stderr, "Error: -d requires a depth argument.\n");
+                return 1;
+            }
+            depth = atoi(argv[++a]);
+            if (depth < 1) {
+                fprintf(stderr, "Error: depth must be ≥ 1.\n");
+                return 1;
+            }
         } else {
             fprintf(stderr,
                 "Unknown argument: %s\n"
-                "Usage: %s [-m M]   (reads from stdin)\n",
+                "Usage: %s [-m M] [-e] [-d DEPTH] [-i INPUT_FILE]\n"
+                "  -i FILE   read payload from FILE instead of stdin\n",
                 argv[a], argv[0]);
             return 1;
         }
@@ -237,20 +241,47 @@ int main(int argc, char *argv[])
         (float)CARRIER_CYCLES * SAMPLE_RATE / FRAMES_PER_BUFFER;
 
     fprintf(stderr,
-            "%d-PSK transmitter — %d bit%s/symbol, carrier %.0f Hz\n",
-            M, bps, bps == 1 ? "" : "s", carrier_hz);
+            "%d-PSK transmitter — %d bit%s/symbol, carrier %.0f Hz%s\n",
+            M, bps, bps == 1 ? "" : "s", carrier_hz,
+            fec ? " [FEC on]" : "");
 
-    /* ── read input data ──────────────────────────────────────────── */
-    size_t   data_len;
-    uint8_t *data = read_stdin(&data_len);
-    if (!data) {
-        fprintf(stderr, "Error: failed to allocate read buffer.\n");
-        return 1;
+    /* ── read input data (file or stdin) ─────────────────────────── */
+    size_t   data_len = 0;
+    uint8_t *data     = NULL;
+
+    if (input_file) {
+        data = psk_read_file(input_file, &data_len);
+        if (!data) return 1;   /* psk_read_file printed the error    */
+    } else {
+        data = psk_read_stream(stdin, &data_len);
+        if (!data) {
+            fprintf(stderr, "Error: failed to read from stdin.\n");
+            return 1;
+        }
     }
     if (data_len == 0) {
-        fprintf(stderr, "Error: no input data on stdin.\n");
+        fprintf(stderr, "Error: no input data%s.\n",
+                input_file ? " in file" : " on stdin");
         free(data);
         return 1;
+    }
+
+    /* ── optional FEC encode (Hamming(7,4) + block interleave) ──────── */
+    if (fec) {
+        size_t   enc_len;
+        uint8_t *enc = psk_fec_encode(data, data_len, depth, &enc_len);
+        free(data);
+        if (!enc) {
+            fprintf(stderr, "Error: FEC encode allocation failed.\n");
+            return 1;
+        }
+        data     = enc;
+        data_len = enc_len;
+        fprintf(stderr,
+                "FEC: Hamming(7,4) + interleave depth %d  "
+                "(%zu → %zu bytes, rate %.0f%%)\n",
+                depth, data_len * 4 / 7, data_len,
+                100.0f * 4.0f / 7.0f);
     }
 
     /* ── convert bytes → Gray-coded M-PSK symbols ─────────────────── */

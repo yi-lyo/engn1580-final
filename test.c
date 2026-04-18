@@ -1105,6 +1105,568 @@ static void test_loopback(void)
 }
 
 /* ═════════════════════════════════════════════════════════════════
+ * 10. FEC — Hamming(7,4) + block interleaving + channel quality
+ * ═════════════════════════════════════════════════════════════════ */
+
+static void test_fec(void)
+{
+    section("FEC: Hamming(7,4) codeword encode / decode");
+
+    /* ── Known codeword values ─────────────────────────────────── */
+    /* Nibble 0x0 = 0000: p1=0,p2=0,p3=0 → codeword = 0b0000000 = 0 */
+    ASSERT_EQ((int)psk_hamming_encode(0x0), 0,
+              "hamming_encode(0x0) = 0b0000000");
+
+    /* Nibble 0xF = 1111: d1=d2=d3=d4=1 → p1=1^1^1=1, p2=1^1^1=1, p3=1^1^1=1
+     * codeword: d4=1,d3=1,d2=1,p3=1,d1=1,p2=1,p1=1 = 0b1111111 = 127 */
+    ASSERT_EQ((int)psk_hamming_encode(0xF), 127,
+              "hamming_encode(0xF) = 0b1111111");
+
+    /* Nibble 0x5 = 0101: d1=1,d2=0,d3=1,d4=0
+     * p1=1^0^0=1, p2=1^1^0=0, p3=0^1^0=1
+     * [6]=0,[5]=1,[4]=0,[3]=1,[2]=1,[1]=0,[0]=1 = 0b0101101 = 45 */
+    ASSERT_EQ((int)psk_hamming_encode(0x5), 45,
+              "hamming_encode(0x5) = 45  (hand-verified)");
+
+    /* ── Roundtrip for all nibbles 0..15 ──────────────────────── */
+    {
+        int ok = 1;
+        for (int n = 0; n < 16; n++) {
+            uint8_t out = 0xFF;
+            int status  = psk_hamming_decode(psk_hamming_encode((uint8_t)n), &out);
+            if (status != 0 || out != (uint8_t)n) { ok = 0; break; }
+        }
+        ASSERT(ok, "hamming roundtrip: decode(encode(n))==n for n=0..15, no error");
+    }
+
+    /* ── Single-bit error correction for all nibbles × all positions */
+    {
+        int ok = 1;
+        for (int n = 0; n < 16 && ok; n++) {
+            uint8_t cw = psk_hamming_encode((uint8_t)n);
+            for (int pos = 0; pos < PSK_HAMMING_N && ok; pos++) {
+                uint8_t bad = cw ^ (uint8_t)(1u << pos);
+                uint8_t out = 0xFF;
+                int status  = psk_hamming_decode(bad, &out);
+                if (status != 1 || out != (uint8_t)n) ok = 0;
+            }
+        }
+        ASSERT(ok,
+               "single-bit correction: all 16 nibbles × 7 error positions corrected");
+    }
+
+    /* ── No-error path returns status 0 ───────────────────────── */
+    {
+        uint8_t out;
+        ASSERT_EQ(psk_hamming_decode(psk_hamming_encode(0xA), &out), 0,
+                  "decode with no error returns status 0");
+        ASSERT_EQ((int)out, 0xA, "decode with no error gives correct nibble");
+    }
+
+    section("FEC: psk_fec_encode / psk_fec_decode pipeline");
+
+    /* ── Roundtrip for several strings and depths ──────────────── */
+    {
+        const char *msg     = "Hello, PSK!";
+        size_t      msg_len = strlen(msg);
+        int depths[] = {1, 4, 8, 16};
+
+        for (int di = 0; di < 4; di++) {
+            int    d = depths[di];
+            size_t enc_len = 0;
+            uint8_t *enc = psk_fec_encode((const uint8_t *)msg,
+                                           msg_len, d, &enc_len);
+            size_t   dec_len = 0;
+            int      corr    = -1;
+            uint8_t *dec = psk_fec_decode(enc, enc_len, d, &dec_len, &corr);
+
+            int ok = (dec_len >= msg_len) &&
+                     (memcmp(msg, dec, msg_len) == 0) &&
+                     (corr == 0);
+            char lbl[80];
+            snprintf(lbl, sizeof(lbl),
+                     "FEC roundtrip depth=%d '%s'", d, msg);
+            ASSERT(ok, lbl);
+            free(enc); free(dec);
+        }
+    }
+
+    /* ── Rate is 4/7: encoded length ≈ input × 7/4 ─────────────── */
+    {
+        const uint8_t data[8] = {0xAA, 0xBB, 0xCC, 0xDD,
+                                  0x11, 0x22, 0x33, 0x44};
+        size_t enc_len = 0;
+        uint8_t *enc   = psk_fec_encode(data, 8, 8, &enc_len);
+        /* 8 bytes × 8 bits / 4 × 7 = 112 bits = 14 bytes */
+        ASSERT(enc_len >= 14 && enc_len <= 16,
+               "FEC encoded length: 8 bytes → 14-16 encoded bytes (rate 4/7)");
+        free(enc);
+    }
+
+    /* ── Corrects sparse single-bit errors (one per codeword) ───── */
+    {
+        const char *msg = "Test data for FEC sparse errors!";
+        size_t msg_len  = strlen(msg);
+        int    depth    = 8;
+        size_t enc_len  = 0;
+
+        uint8_t *enc = psk_fec_encode((const uint8_t *)msg,
+                                       msg_len, depth, &enc_len);
+        /* Flip one bit every 7 bytes (one bit per codeword) */
+        for (size_t i = 0; i < enc_len; i += 7)
+            enc[i] ^= 0x01u;
+
+        int      corr    = 0;
+        size_t   dec_len = 0;
+        uint8_t *dec = psk_fec_decode(enc, enc_len, depth, &dec_len, &corr);
+
+        int ok = (dec_len >= msg_len) &&
+                 (memcmp(msg, dec, msg_len) == 0);
+        ASSERT(ok, "FEC corrects sparse 1-bit errors (1 per codeword)");
+        ASSERT(corr > 0, "FEC reports non-zero corrections for injected errors");
+        free(enc); free(dec);
+    }
+
+    /* ── Burst error correction (burst ≤ depth) ────────────────── */
+    {
+        const char *msg  = "Burst error resilience test.";
+        size_t msg_len   = strlen(msg);
+        int    depth     = 8;
+        size_t enc_len   = 0;
+
+        uint8_t *enc = psk_fec_encode((const uint8_t *)msg,
+                                       msg_len, depth, &enc_len);
+        /* Flip 7 consecutive bits (burst = depth - 1 = 7) starting at bit 0 */
+        for (int b = 0; b < 7; b++)
+            psk_setbit(enc, (size_t)b, 1 - psk_getbit(enc, (size_t)b));
+
+        int      corr    = 0;
+        size_t   dec_len = 0;
+        uint8_t *dec = psk_fec_decode(enc, enc_len, depth, &dec_len, &corr);
+
+        int ok = (dec_len >= msg_len) &&
+                 (memcmp(msg, dec, msg_len) == 0);
+        ASSERT(ok,
+               "FEC corrects burst of 7 consecutive bit errors (depth=8)");
+        free(enc); free(dec);
+    }
+
+    /* ── Encode + decode is identity when no errors ─────────────── */
+    {
+        uint8_t data[32];
+        for (int i = 0; i < 32; i++) data[i] = (uint8_t)(i * 13 + 7);
+        size_t enc_len = 0;
+        uint8_t *enc = psk_fec_encode(data, 32, PSK_DEFAULT_ILVE_DEPTH, &enc_len);
+        int      corr    = 99;
+        size_t   dec_len = 0;
+        uint8_t *dec = psk_fec_decode(enc, enc_len, PSK_DEFAULT_ILVE_DEPTH,
+                                       &dec_len, &corr);
+        ASSERT(memcmp(data, dec, 32) == 0,
+               "FEC identity: encode then decode with no errors = original");
+        ASSERT_EQ(corr, 0,
+               "FEC identity: zero corrections when no errors injected");
+        free(enc); free(dec);
+    }
+
+    section("FEC: SNR estimation");
+
+    /* ── Strong carrier → high SNR ──────────────────────────────── */
+    {
+        float mags[100];
+        memset(mags, 0, sizeof(mags));
+        /* Carrier at bin 64, amplitude 2048; noise floor ~1 */
+        mags[PSK_CARRIER_BIN] = 2048.0f;
+        for (int k = 0; k < 100; k++)
+            if (k != PSK_CARRIER_BIN) mags[k] = 1.0f;
+        float snr = psk_snr_estimate_db(mags, 100, PSK_CARRIER_BIN);
+        ASSERT(snr > 20.0f,
+               "SNR estimate: strong carrier (2048) vs noise (1) → SNR > 20 dB");
+    }
+
+    /* ── Equal power carrier and noise → SNR near 0 dB ─────────── */
+    {
+        float mags[100];
+        for (int k = 0; k < 100; k++) mags[k] = 10.0f;
+        float snr = psk_snr_estimate_db(mags, 100, PSK_CARRIER_BIN);
+        ASSERT(snr >= -3.0f && snr <= 3.0f,
+               "SNR estimate: uniform spectrum → SNR ≈ 0 dB");
+    }
+
+    /* ── Silence → returns -60 dB ───────────────────────────────── */
+    {
+        float mags[100];
+        memset(mags, 0, sizeof(mags));
+        float snr = psk_snr_estimate_db(mags, 100, PSK_CARRIER_BIN);
+        ASSERT(snr <= -59.0f,
+               "SNR estimate: silence → SNR ≤ −60 dB");
+    }
+
+    section("FEC: interference detection");
+
+    /* ── Interferer at 60% of carrier → detected ────────────────── */
+    {
+        float mags[100];
+        memset(mags, 0, sizeof(mags));
+        mags[PSK_CARRIER_BIN] = 100.0f;
+        mags[30]              = 60.0f;   /* 60% of carrier, far from guard */
+        int bin = -1;
+        int detected = psk_detect_interference(mags, 100, PSK_CARRIER_BIN, &bin);
+        ASSERT(detected == 1,
+               "interference detected: bin 30 at 60% of carrier amplitude");
+        ASSERT_EQ(bin, 30, "strongest interferer correctly identified at bin 30");
+    }
+
+    /* ── Interferer at 40% of carrier → not flagged ─────────────── */
+    {
+        float mags[100];
+        memset(mags, 0, sizeof(mags));
+        mags[PSK_CARRIER_BIN] = 100.0f;
+        mags[30]              = 40.0f;   /* 40% — below PSK_INTF_RATIO=0.5 */
+        int detected = psk_detect_interference(mags, 100, PSK_CARRIER_BIN, NULL);
+        ASSERT(detected == 0,
+               "no interference: bin 30 at 40% of carrier (below threshold)");
+    }
+
+    /* ── Bins inside the guard zone are not flagged ──────────────── */
+    {
+        float mags[100];
+        memset(mags, 0, sizeof(mags));
+        mags[PSK_CARRIER_BIN]           = 100.0f;
+        mags[PSK_CARRIER_BIN + 1]       = 90.0f;   /* inside guard zone */
+        mags[PSK_CARRIER_BIN - 2]       = 90.0f;   /* on guard boundary */
+        int detected = psk_detect_interference(mags, 100, PSK_CARRIER_BIN, NULL);
+        ASSERT(detected == 0,
+               "guard zone: adjacent bins not flagged as interference");
+    }
+
+    /* ── No carrier → no interference flagged ───────────────────── */
+    {
+        float mags[100];
+        memset(mags, 0, sizeof(mags));
+        int detected = psk_detect_interference(mags, 100, PSK_CARRIER_BIN, NULL);
+        ASSERT(detected == 0,
+               "silence: no interference detected when carrier is absent");
+    }
+}
+
+/* ═════════════════════════════════════════════════════════════════
+ * 11. File I/O — psk_read_file / psk_write_file / roundtrip
+ *
+ * These tests verify that:
+ *   a) psk_write_file creates a file whose bytes match the source buffer.
+ *   b) psk_read_file reads that file back byte-for-byte.
+ *   c) A full file-to-file encode → software-loopback → decode pipeline
+ *      reproduces the original input file exactly (byte-exact match).
+ *      The test is run for every combination of M ∈ {2,4,8} and
+ *      FEC ∈ {off, depth=8} so that both code paths are exercised.
+ * ═════════════════════════════════════════════════════════════════ */
+
+/* Temporary file paths used by the file-I/O tests.
+ * Both are cleaned up at the end of test_file_io().             */
+#define TEST_IN_PATH   "/tmp/psk_test_input.bin"
+#define TEST_OUT_PATH  "/tmp/psk_test_output.bin"
+
+/* ── helpers ────────────────────────────────────────────────────── */
+
+/* Read the entire contents of `path` into a malloc buffer.
+ * Returns NULL on failure.  *len is set to the byte count.       */
+static uint8_t *slurp(const char *path, size_t *len)
+{
+    *len = 0;
+    FILE *fp = fopen(path, "rb");
+    if (!fp) return NULL;
+    uint8_t *buf = psk_read_stream(fp, len);
+    fclose(fp);
+    return buf;
+}
+
+/* ── core file-roundtrip logic ─────────────────────────────────── */
+/*
+ * run_file_roundtrip
+ *
+ * 1. Write `payload` to TEST_IN_PATH.
+ * 2. Read it back via psk_read_file (tests file-read path).
+ * 3. Optionally FEC-encode (tests encode pipeline on file data).
+ * 4. Run the software-channel loopback (same as run_loopback):
+ *      psk_generate_tx_buffer × N → psk_rx_process_window
+ * 5. Collect per-symbol decoded bytes and optionally FEC-decode.
+ * 6. Write the decoded bytes to TEST_OUT_PATH via psk_write_file.
+ * 7. Read TEST_OUT_PATH back and compare with `payload` byte-for-byte.
+ *
+ * Returns 1 on byte-exact match, 0 on any mismatch or failure.
+ */
+static int run_file_roundtrip(const uint8_t *payload, size_t payload_len,
+                               int M, int fec_depth)
+{
+    int use_fec = (fec_depth > 0);
+    int bps     = psk_ilog2(M);
+
+    /* ── 1. Write input file ────────────────────────────────────── */
+    if (psk_write_file(TEST_IN_PATH, payload, payload_len) != 0)
+        return 0;
+
+    /* ── 2. Read it back via psk_read_file ──────────────────────── */
+    size_t   read_len = 0;
+    uint8_t *read_buf = psk_read_file(TEST_IN_PATH, &read_len);
+    if (!read_buf || read_len != payload_len ||
+        memcmp(payload, read_buf, payload_len) != 0) {
+        free(read_buf);
+        return 0;
+    }
+    free(read_buf);
+
+    /* ── 3. Optional FEC encode ─────────────────────────────────── */
+    size_t   tx_len  = 0;
+    uint8_t *tx_data = NULL;
+
+    if (use_fec) {
+        tx_data = psk_fec_encode(payload, payload_len, fec_depth, &tx_len);
+    } else {
+        tx_len  = payload_len;
+        tx_data = malloc(tx_len);
+        if (tx_data) memcpy(tx_data, payload, tx_len);
+    }
+    if (!tx_data) return 0;
+
+    /* ── 4. Build symbol array: preamble + data ─────────────────── */
+    size_t   n_data   = 0;
+    uint8_t *data_syms = psk_bytes_to_symbols(tx_data, tx_len, bps, &n_data);
+    free(tx_data);
+    if (!data_syms) return 0;
+
+    size_t   n_total  = (size_t)PSK_PREAMBLE_SYMBOLS + n_data;
+    uint8_t *all_syms = calloc(n_total, 1);
+    if (!all_syms) { free(data_syms); return 0; }
+    memcpy(all_syms + PSK_PREAMBLE_SYMBOLS, data_syms, n_data);
+    free(data_syms);
+
+    /* ── 5. Generate audio + run receiver window-by-window ───────── */
+    size_t  audio_len = n_total * (size_t)PSK_SAMPLES_PER_SYMBOL;
+    float  *audio     = malloc(audio_len * sizeof(float));
+    if (!audio) { free(all_syms); return 0; }
+
+    for (size_t si = 0; si < n_total; si++) {
+        float *dst = audio + si * (size_t)PSK_SAMPLES_PER_SYMBOL;
+        for (int bi = 0; bi < PSK_BUFFERS_PER_SYMBOL; bi++)
+            psk_generate_tx_buffer(dst + bi * PSK_FRAMES_PER_BUF_TX,
+                                   all_syms[si], M);
+    }
+
+    /* Collect one decoded symbol per data-symbol slot (first hit wins) */
+    if (n_data == 0 || n_data > (size_t)0x100000) {
+        /* Upper bound guards against GCC's -Walloc-size-larger-than */
+        free(audio); free(all_syms);
+        return 0;
+    }
+    uint8_t *rx_syms = calloc(n_data, 1);
+    int     *got     = calloc(n_data, sizeof(int));
+    if (!rx_syms || !got) {
+        free(audio); free(all_syms); free(rx_syms); free(got);
+        return 0;
+    }
+
+    PskRxState s;
+    psk_rx_state_init(&s);
+    size_t audio_pos = 0;
+
+    while (audio_pos + (size_t)PSK_FRAMES_PER_BUF_RX <= audio_len) {
+        int result = psk_rx_process_window(&s, audio + audio_pos, M);
+        if (result >= 0) {
+            size_t mid   = audio_pos + (size_t)(PSK_FRAMES_PER_BUF_RX / 2);
+            size_t tx_si = mid / (size_t)PSK_SAMPLES_PER_SYMBOL;
+            if (tx_si >= (size_t)PSK_PREAMBLE_SYMBOLS && tx_si < n_total) {
+                size_t di = tx_si - (size_t)PSK_PREAMBLE_SYMBOLS;
+                if (!got[di]) {
+                    rx_syms[di] = (uint8_t)result;
+                    got[di]     = 1;
+                }
+            }
+        }
+        audio_pos += (size_t)PSK_FRAMES_PER_BUF_RX;
+    }
+
+    free(audio); free(all_syms); free(got);
+
+    /* ── 6. symbols → bytes (reverse of the encode step) ─────────── */
+    size_t   raw_len = 0;
+    uint8_t *raw     = psk_symbols_to_bytes(rx_syms, n_data, bps, &raw_len);
+    free(rx_syms);
+    if (!raw) return 0;
+
+    /* Optional FEC decode */
+    uint8_t *decoded  = NULL;
+    size_t   dec_len  = 0;
+
+    if (use_fec) {
+        int corr = 0;
+        decoded  = psk_fec_decode(raw, raw_len, fec_depth, &dec_len, &corr);
+        free(raw);
+    } else {
+        decoded = raw;
+        dec_len = raw_len;
+    }
+    if (!decoded) return 0;
+
+    /* ── 7. Write output file via psk_write_file ─────────────────── */
+    int write_ok = (psk_write_file(TEST_OUT_PATH, decoded, dec_len) == 0);
+    free(decoded);
+    if (!write_ok) return 0;
+
+    /* ── 8. Read output file back and compare with original ─────── */
+    size_t   out_len = 0;
+    uint8_t *out_buf = slurp(TEST_OUT_PATH, &out_len);
+    if (!out_buf) return 0;
+
+    int match = (out_len >= payload_len) &&
+                (memcmp(payload, out_buf, payload_len) == 0);
+    free(out_buf);
+    return match;
+}
+
+static void test_file_io(void)
+{
+    section("File I/O: psk_read_file / psk_write_file");
+
+    /* ── Basic write → read roundtrip ───────────────────────────── */
+    {
+        const uint8_t data[] = {0xDE, 0xAD, 0xBE, 0xEF,
+                                 0x00, 0x01, 0x7F, 0xFF};
+        ASSERT(psk_write_file(TEST_IN_PATH, data, sizeof(data)) == 0,
+               "psk_write_file: binary data written without error");
+
+        size_t   rlen = 0;
+        uint8_t *rbuf = psk_read_file(TEST_IN_PATH, &rlen);
+        ASSERT(rbuf != NULL, "psk_read_file: returned non-NULL for existing file");
+        ASSERT_EQ((int)rlen, (int)sizeof(data),
+                  "psk_read_file: byte count matches written size");
+        ASSERT(memcmp(data, rbuf, sizeof(data)) == 0,
+               "psk_read_file: bytes match byte-for-byte");
+        free(rbuf);
+    }
+
+    /* ── Write empty file ───────────────────────────────────────── */
+    {
+        ASSERT(psk_write_file(TEST_IN_PATH, (const uint8_t *)"", 0) == 0,
+               "psk_write_file: zero-length write succeeds");
+        size_t   rlen = 99;
+        uint8_t *rbuf = psk_read_file(TEST_IN_PATH, &rlen);
+        ASSERT(rbuf != NULL && rlen == 0,
+               "psk_read_file: reading empty file returns length 0");
+        free(rbuf);
+    }
+
+    /* ── Read non-existent file returns NULL ────────────────────── */
+    {
+        size_t   rlen = 0;
+        uint8_t *rbuf = psk_read_file("/tmp/psk_no_such_file_xyz.bin", &rlen);
+        ASSERT(rbuf == NULL,
+               "psk_read_file: returns NULL for non-existent path");
+    }
+
+    /* ── psk_read_stream from a file pointer ────────────────────── */
+    {
+        const char *text = "stream test data\n";
+        psk_write_file(TEST_IN_PATH, (const uint8_t *)text, strlen(text));
+        FILE   *fp  = fopen(TEST_IN_PATH, "rb");
+        size_t  len = 0;
+        uint8_t *buf = psk_read_stream(fp, &len);
+        fclose(fp);
+        ASSERT(buf != NULL && len == strlen(text) &&
+               memcmp(text, buf, len) == 0,
+               "psk_read_stream: reads stream content correctly");
+        free(buf);
+    }
+
+    /* ── Large binary file roundtrip ────────────────────────────── */
+    {
+        uint8_t big[512];
+        for (int i = 0; i < 512; i++) big[i] = (uint8_t)(i * 17 + 3);
+        psk_write_file(TEST_IN_PATH, big, sizeof(big));
+        size_t   rlen = 0;
+        uint8_t *rbuf = psk_read_file(TEST_IN_PATH, &rlen);
+        int ok = (rbuf != NULL) && (rlen == 512) &&
+                 (memcmp(big, rbuf, 512) == 0);
+        ASSERT(ok, "psk_write_file / psk_read_file: 512-byte binary roundtrip");
+        free(rbuf);
+    }
+
+    section("File I/O: full file-to-file encode → loopback → decode");
+
+    /* Common test payloads */
+    const char *hello   = "Hello, File I/O!";
+    const uint8_t ramp[32] = {
+        0, 8, 16, 24, 32, 40, 48, 56, 64, 72, 80, 88, 96,104,112,120,
+       128,136,144,152,160,168,176,184,192,200,208,216,224,232,240,248
+    };
+    uint8_t counter[48];
+    for (int i = 0; i < 48; i++) counter[i] = (uint8_t)i;
+
+    /* ── Aligned file roundtrip, no FEC, all M values ──────────── */
+    printf("\n  [No FEC — raw PSK file-to-file roundtrip]\n");
+    for (int M = 2; M <= 8; M *= 2) {
+        {
+            int ok = run_file_roundtrip((const uint8_t *)hello,
+                                         strlen(hello), M, 0);
+            char lbl[80];
+            snprintf(lbl, sizeof(lbl),
+                     "File roundtrip: hello  M=%-2d  no-FEC", M);
+            ASSERT(ok, lbl);
+        }
+        {
+            int ok = run_file_roundtrip(ramp, sizeof(ramp), M, 0);
+            char lbl[80];
+            snprintf(lbl, sizeof(lbl),
+                     "File roundtrip: ramp   M=%-2d  no-FEC", M);
+            ASSERT(ok, lbl);
+        }
+    }
+
+    /* ── Aligned file roundtrip with FEC, all M values ─────────── */
+    printf("\n  [FEC depth=8 — Hamming(7,4) + interleave file-to-file]\n");
+    for (int M = 2; M <= 8; M *= 2) {
+        {
+            int ok = run_file_roundtrip((const uint8_t *)hello,
+                                         strlen(hello), M, 8);
+            char lbl[80];
+            snprintf(lbl, sizeof(lbl),
+                     "File roundtrip: hello  M=%-2d  FEC depth=8", M);
+            ASSERT(ok, lbl);
+        }
+        {
+            int ok = run_file_roundtrip(counter, sizeof(counter), M, 8);
+            char lbl[80];
+            snprintf(lbl, sizeof(lbl),
+                     "File roundtrip: counter M=%-2d  FEC depth=8", M);
+            ASSERT(ok, lbl);
+        }
+    }
+
+    /* ── Output file content matches input byte-for-byte ─────────── */
+    /* (Run one explicit check so the test makes the comparison visible) */
+    {
+        const char *msg = "ENGN1580 file match test";
+        run_file_roundtrip((const uint8_t *)msg, strlen(msg), 4, 0);
+
+        size_t in_len  = 0, out_len = 0;
+        uint8_t *in_buf  = slurp(TEST_IN_PATH,  &in_len);
+        uint8_t *out_buf = slurp(TEST_OUT_PATH, &out_len);
+
+        int ok = (in_buf && out_buf &&
+                  in_len == strlen(msg) &&
+                  out_len >= strlen(msg) &&
+                  memcmp(in_buf, out_buf, strlen(msg)) == 0);
+        ASSERT(ok,
+               "File match: TEST_IN_PATH and TEST_OUT_PATH identical after QPSK roundtrip");
+
+        free(in_buf); free(out_buf);
+    }
+
+    /* ── Cleanup temp files ─────────────────────────────────────── */
+    remove(TEST_IN_PATH);
+    remove(TEST_OUT_PATH);
+}
+
+/* ═════════════════════════════════════════════════════════════════
  * main
  * ═════════════════════════════════════════════════════════════════ */
 int main(void)
@@ -1121,7 +1683,9 @@ int main(void)
     test_phase_decode();
     test_timing();
     test_pll();
+    test_fec();
     test_loopback();
+    test_file_io();
 
     printf("\n");
     printf("══════════════════════════════════════════════\n");

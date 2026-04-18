@@ -44,6 +44,7 @@
 #include <string.h>
 #include <SDL2/SDL.h>
 #include <SDL2/SDL_ttf.h>
+#include "psk_common.h"
 
 /* ═══════════════════════════════════════════════════════════════════
  * Signal / demodulation constants
@@ -70,7 +71,7 @@
  * Window / chart geometry
  * ═══════════════════════════════════════════════════════════════════ */
 #define WIN_W     1130
-#define WIN_H      615   /* extra rows for timing/PLL sync indicator         */
+#define WIN_H      645   /* extra rows for timing/PLL/SNR/FEC indicators     */
 
 #define CHART_X     50
 #define CHART_Y     46
@@ -82,7 +83,8 @@
 #define AXIS_Y   (CHART_Y + CHART_H +  8)   /* Hz tick labels               */
 #define INFO_Y   (CHART_Y + CHART_H + 34)   /* carrier / decode readout     */
 #define SYNC_Y   (CHART_Y + CHART_H + 60)   /* timing + PLL row             */
-#define HINT_Y   (CHART_Y + CHART_H + 92)   /* keyboard hint                */
+#define STAT_Y   (CHART_Y + CHART_H + 86)   /* SNR / FEC / interference row */
+#define HINT_Y   (CHART_Y + CHART_H + 118)  /* keyboard hint                */
 
 /* ── Timing / carrier-recovery parameters ─────────────────────────── */
 /*
@@ -447,7 +449,12 @@ static void render_frame(SDL_Renderer *ren, TTF_Font *font,
                           /* timing recovery */
                           int sym_window, int is_boundary, int timing_locked,
                           /* carrier PLL */
-                          float pll_error_deg)
+                          float pll_error_deg,
+                          /* channel quality */
+                          float snr_db, int interference, int intf_bin,
+                          /* FEC */
+                          int fec_enabled, int fec_corrections,
+                          int fec_depth)
 {
     const float hz_per_bin =
         (float)SAMPLE_RATE / (float)FRAMES_PER_BUFFER;   /* ≈ 11.72 Hz */
@@ -598,6 +605,96 @@ static void render_frame(SDL_Renderer *ren, TTF_Font *font,
             SDL_Color c = {48, 48, 75, 255};
             draw_text(ren, font, "Q / Esc  to quit",
                       CHART_X + CHART_W - 118, HINT_Y, c);
+        }
+    }
+
+    /* ── Channel-quality / FEC status row (STAT_Y) ──────────────────
+     *
+     * SNR estimate
+     * ────────────
+     * 10·log10(carrier_power / mean_noise_power) from the DFT magnitudes.
+     * Colour: green ≥ 20 dB (good), yellow ≥ 10 dB (fair), red < 10 dB.
+     *
+     * Interference indicator
+     * ──────────────────────
+     * Lit when any non-carrier bin exceeds 50% of the carrier amplitude.
+     * Shows the interfering bin index and its frequency.
+     *
+     * FEC statistics
+     * ──────────────
+     * When FEC is enabled (-e flag) shows the running count of single-bit
+     * corrections made by Hamming(7,4) decoding.
+     * ─────────────────────────────────────────────────────────────── */
+    {
+        SDL_Color dim = {70, 70, 100, 255};
+        int x = CHART_X;
+
+        /* SNR bar */
+        draw_text(ren, font, "SNR:", x, STAT_Y + 4, dim);
+        x += 38;
+
+        {
+            const int BAR_W = 100, BAR_H = 10;
+            const int bar_y = STAT_Y + (22 - BAR_H) / 2;
+
+            SDL_SetRenderDrawColor(ren, 25, 25, 45, 255);
+            SDL_Rect bg = {x, bar_y, BAR_W, BAR_H};
+            SDL_RenderFillRect(ren, &bg);
+
+            /* Fill proportional to SNR: 0 dB → empty, 30 dB → full */
+            float fill = (snr_db + 0.0f) / 30.0f;
+            if (fill < 0.0f) fill = 0.0f;
+            if (fill > 1.0f) fill = 1.0f;
+            int fill_w = (int)(fill * BAR_W);
+            if (fill_w > 0) {
+                Uint8 r = fill >= 0.67f ? 0 : fill >= 0.33f ? 190 : 210;
+                Uint8 g = fill >= 0.67f ? 195 : fill >= 0.33f ? 175 : 55;
+                Uint8 b = 0;
+                SDL_SetRenderDrawColor(ren, r, g, b, 255);
+                SDL_Rect bar = {x, bar_y, fill_w, BAR_H};
+                SDL_RenderFillRect(ren, &bar);
+            }
+
+            SDL_SetRenderDrawColor(ren, 50, 50, 80, 255);
+            SDL_RenderDrawRect(ren, &bg);
+        }
+        x += 106;
+
+        {
+            char snr_buf[24];
+            snprintf(snr_buf, sizeof(snr_buf), "%.1f dB", snr_db);
+            SDL_Color sc = snr_db >= 20.0f ? (SDL_Color){0, 200, 100, 255} :
+                           snr_db >= 10.0f ? (SDL_Color){200, 170, 0, 255} :
+                                             (SDL_Color){210, 60, 30, 255};
+            draw_text(ren, font, snr_buf, x, STAT_Y + 4, sc);
+        }
+        x += 70;
+
+        /* Interference indicator */
+        if (interference) {
+            float hz_per_bin = (float)SAMPLE_RATE / (float)FRAMES_PER_BUFFER;
+            char intf_buf[64];
+            snprintf(intf_buf, sizeof(intf_buf),
+                     "\xe2\x9a\xa0 INTF @ bin %d (%.0f Hz)",
+                     intf_bin, (float)intf_bin * hz_per_bin);
+            SDL_Color ic = {220, 100, 20, 255};
+            draw_text(ren, font, intf_buf, x, STAT_Y + 4, ic);
+            x += 200;
+        }
+
+        /* FEC statistics */
+        if (fec_enabled) {
+            char fec_buf[64];
+            snprintf(fec_buf, sizeof(fec_buf),
+                     "FEC(7,4) depth=%d  corrections: %d",
+                     fec_depth, fec_corrections);
+            SDL_Color fc = fec_corrections > 0
+                ? (SDL_Color){  0, 200, 140, 255}
+                : (SDL_Color){ 80, 130, 160, 255};
+            draw_text(ren, font, fec_buf, x, STAT_Y + 4, fc);
+        } else {
+            draw_text(ren, font, "FEC: off  (-e to enable)",
+                      x, STAT_Y + 4, dim);
         }
     }
 
@@ -826,11 +923,35 @@ int main(int argc, char *argv[])
 {
     /* ── argument parsing ─────────────────────────────────────────── */
     int            M            = 4;   /* default: QPSK */
+    int            fec_enabled  = 0;
+    int            fec_depth    = PSK_DEFAULT_ILVE_DEPTH;
+    const char    *output_file  = NULL; /* NULL → no file output        */
     PaDeviceIndex  forced_device = paNoDevice;
     const char    *name_pattern  = NULL;
 
     for (int a = 1; a < argc; a++) {
-        if (strcmp(argv[a], "--list-devices") == 0) {
+        if (strcmp(argv[a], "-e") == 0) {
+            fec_enabled = 1;
+
+        } else if (strcmp(argv[a], "-o") == 0) {
+            if (a + 1 >= argc) {
+                fprintf(stderr, "Error: -o requires a filename.\n");
+                return 1;
+            }
+            output_file = argv[++a];
+
+        } else if (strcmp(argv[a], "-d") == 0) {
+            if (a + 1 >= argc) {
+                fprintf(stderr, "Error: -d requires a depth argument.\n");
+                return 1;
+            }
+            fec_depth = atoi(argv[++a]);
+            if (fec_depth < 1) {
+                fprintf(stderr, "Error: depth must be >= 1.\n");
+                return 1;
+            }
+
+        } else if (strcmp(argv[a], "--list-devices") == 0) {
             PaError ie = Pa_Initialize();
             if (ie != paNoError) {
                 fprintf(stderr, "Pa_Initialize: %s\n", Pa_GetErrorText(ie));
@@ -863,9 +984,9 @@ int main(int argc, char *argv[])
                 return 1;
             }
 
-        } else if (strcmp(argv[a], "-d") == 0) {
+        } else if (strcmp(argv[a], "--device") == 0) {
             if (a + 1 >= argc) {
-                fprintf(stderr, "Error: -d requires a device index.\n");
+                fprintf(stderr, "Error: --device requires a device index.\n");
                 return 1;
             }
             char *ep;
@@ -885,7 +1006,9 @@ int main(int argc, char *argv[])
 
         } else {
             fprintf(stderr, "Unknown argument: %s\n"
-                    "Usage: %s [-m M] [-d <idx>] [-n <substr>] [--list-devices]\n",
+                    "Usage: %s [-m M] [-e] [-d DEPTH] [-o OUTPUT_FILE]\n"
+                    "          [--device <idx>] [-n <substr>] [--list-devices]\n"
+                    "  -o FILE   write decoded bytes to FILE when carrier drops\n",
                     argv[a], argv[0]);
             return 1;
         }
@@ -1041,6 +1164,18 @@ int main(int argc, char *argv[])
         memset(magnitudes, 0, sizeof(magnitudes));
         memset(peaks,      0, sizeof(peaks));
 
+        /* Channel quality state */
+        float snr_db      = -60.0f;
+        int   interference = 0;
+        int   intf_bin     = 0;
+
+        /* FEC decode accumulator — collects raw symbol bytes, then
+         * deinterleaves + Hamming-decodes when the carrier drops.  */
+        uint8_t *fec_sym_buf     = NULL;   /* grows as symbols arrive  */
+        size_t   fec_sym_cap     = 0;
+        size_t   fec_sym_len     = 0;      /* bytes used               */
+        int      fec_corrections = 0;      /* running correction count */
+
         /* IQ history (unit-circle calibrated carrier phasors) */
         IQ_Point iq_hist[IQ_HISTORY];
         int      iq_head  = 0;
@@ -1093,7 +1228,9 @@ int main(int argc, char *argv[])
         /* Initial blank frame */
         render_frame(ren, font, magnitudes, peaks,
                      0.0f, 0.0f, 0, 0, rx_state, M,
-                     sym_window, is_boundary, timing_locked, pll_error_deg);
+                     sym_window, is_boundary, timing_locked, pll_error_deg,
+                     snr_db, interference, intf_bin,
+                     fec_enabled, fec_corrections, fec_depth);
         render_iq_panel(ren, font, iq_hist, iq_head, iq_count,
                         M, current_sym, rx_state, timing_locked, sym_window);
         SDL_RenderPresent(ren);
@@ -1132,6 +1269,12 @@ int main(int argc, char *argv[])
 
             /* ── compute full FFT (for display) ─────────────────── */
             compute_dft(local_samples, FRAMES_PER_BUFFER, magnitudes);
+
+            /* ── channel quality estimates ──────────────────────── */
+            snr_db     = psk_snr_estimate_db(magnitudes, BAR_WIDTH,
+                                              CARRIER_BIN);
+            interference = psk_detect_interference(magnitudes, BAR_WIDTH,
+                                                    CARRIER_BIN, &intf_bin);
 
             /* ── derived carrier quantities ─────────────────────── */
             float received_phase    = atan2f(local_ft_im, local_ft_re);
@@ -1312,12 +1455,101 @@ int main(int argc, char *argv[])
                 is_boundary = 0;
             }
 
+            /* ── Symbol accumulator (always-on) ──────────────────────
+             *
+             * Regardless of whether FEC is enabled, decoded symbol bits
+             * are packed into fec_sym_buf as a running bitstream.
+             *
+             * When FEC is enabled  → buf contains FEC-encoded bits;
+             *   psk_fec_decode() recovers the original data.
+             * When FEC is disabled → buf contains raw data bits;
+             *   the buffer is written directly as bytes.
+             *
+             * Output is written to the file named by -o (if given) or
+             * printed to stderr as a text preview when carrier drops.
+             */
+            if (rx_state == 2 && !is_boundary) {
+                int    bps      = ilog2(M);
+                size_t bits_now = fec_sym_len * 8;
+
+                /* Grow buffer on demand */
+                if (bits_now + (size_t)bps > fec_sym_cap * 8) {
+                    size_t new_cap = fec_sym_cap + 256;
+                    uint8_t *nb    = realloc(fec_sym_buf, new_cap);
+                    if (nb) {
+                        memset(nb + fec_sym_cap, 0, new_cap - fec_sym_cap);
+                        fec_sym_buf = nb;
+                        fec_sym_cap = new_cap;
+                    }
+                }
+                if (fec_sym_buf) {
+                    /* Append bps bits of current_bits MSB-first */
+                    for (int b = bps - 1; b >= 0; b--) {
+                        psk_setbit(fec_sym_buf, bits_now,
+                                   (current_bits >> b) & 1);
+                        bits_now++;
+                    }
+                    fec_sym_len = (bits_now + 7) / 8;
+                }
+            }
+
+            /* When carrier just dropped: decode accumulated buffer and
+             * write output to the -o file (or print preview to stderr). */
+            if (carrier_mag <= SIG_THRESHOLD && fec_sym_len > 0) {
+                uint8_t *dec  = NULL;
+                size_t   out_n = 0;
+                int      corr  = 0;
+
+                if (fec_enabled) {
+                    dec = psk_fec_decode(fec_sym_buf, fec_sym_len,
+                                         fec_depth, &out_n, &corr);
+                    if (corr > 0) fec_corrections += corr;
+                } else {
+                    /* Raw mode: the bitstream is already decoded data.
+                     * Duplicate the buffer so the free() path is uniform. */
+                    out_n = fec_sym_len;
+                    dec   = malloc(out_n);
+                    if (dec) memcpy(dec, fec_sym_buf, out_n);
+                }
+
+                if (dec) {
+                    /* Write to output file if -o was given */
+                    if (output_file) {
+                        if (psk_write_file(output_file, dec, out_n) == 0)
+                            fprintf(stderr,
+                                    "Output: wrote %zu byte(s) to '%s'.\n",
+                                    out_n, output_file);
+                    }
+
+                    /* Always print a short stderr preview */
+                    if (fec_enabled)
+                        fprintf(stderr,
+                                "Decoded %zu byte(s), %d correction(s): \"",
+                                out_n, corr);
+                    else
+                        fprintf(stderr, "Decoded %zu byte(s): \"", out_n);
+                    for (size_t i = 0; i < out_n && i < 64; i++) {
+                        unsigned char ch = dec[i];
+                        if (ch >= 32 && ch < 127) fputc((int)ch, stderr);
+                        else fprintf(stderr, "\\x%02x", ch);
+                    }
+                    if (out_n > 64) fputs("…", stderr);
+                    fputs("\"\n", stderr);
+
+                    free(dec);
+                }
+
+                fec_sym_len = 0;   /* reset for next transmission */
+            }
+
             /* ── render both panels, then present ───────────────── */
             render_frame(ren, font, magnitudes, peaks,
                          carrier_mag, carrier_phase_deg,
                          current_sym, current_bits, rx_state, M,
                          sym_window, is_boundary, timing_locked,
-                         pll_error_deg);
+                         pll_error_deg,
+                         snr_db, interference, intf_bin,
+                         fec_enabled, fec_corrections, fec_depth);
 
             render_iq_panel(ren, font, iq_hist, iq_head, iq_count,
                             M, current_sym, rx_state,
@@ -1328,6 +1560,7 @@ int main(int argc, char *argv[])
 
         Pa_StopStream(stream);
         Pa_CloseStream(stream);
+        free(fec_sym_buf);
     }
 
 cleanup_pa:
