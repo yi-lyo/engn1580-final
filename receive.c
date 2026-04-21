@@ -65,7 +65,7 @@
  * Each window is FRAMES_PER_BUFFER samples.  With BUFFERS_PER_SYMBOL=64
  * in the transmitter (symbol = 16384 samples) we get 4 windows/symbol.
  * 8 windows ≈ 2 preamble symbols — plenty for stable phase averaging. */
-#define CAL_WINDOWS              16
+#define CAL_WINDOWS              8
 
 /* ═══════════════════════════════════════════════════════════════════
  * Window / chart geometry
