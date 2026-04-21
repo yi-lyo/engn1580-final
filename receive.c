@@ -2020,6 +2020,7 @@ int main(int argc, char *argv[])
         "/usr/share/fonts/liberation-mono/LiberationMono-Regular.ttf",
         "/usr/share/fonts/dejavu-sans-mono-fonts/DejaVuSansMono.ttf",
         "/usr/share/fonts/dejavu/DejaVuSansMono.ttf",
+        "/usr/share/fonts/truetype/ibm-plex/IBMPlexMono-Regular.ttf",
         NULL
     };
     for (int fp = 0; font_paths[fp] && !font; fp++)
