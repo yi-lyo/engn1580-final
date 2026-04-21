@@ -65,7 +65,7 @@
  * Each window is FRAMES_PER_BUFFER samples.  With BUFFERS_PER_SYMBOL=64
  * in the transmitter (symbol = 16384 samples) we get 4 windows/symbol.
  * 8 windows ≈ 2 preamble symbols — plenty for stable phase averaging. */
-#define CAL_WINDOWS              8
+#define CAL_WINDOWS              10
 
 /* ═══════════════════════════════════════════════════════════════════
  * Window / chart geometry
@@ -1608,9 +1608,9 @@ int main(int argc, char *argv[])
                     cal_count = 0;
                 }
 
-                if (rx_state == 1) {
+                if (rx_state == 1 && !is_boundary) {
                     /* Accumulate received phases via circular mean.
-                     * We do NOT skip boundary windows here: the
+                     * We do skip boundary windows here: the
                      * preamble phase is constant (0°) so even a
                      * mixed boundary window averages correctly. */
                     cal_cos += cosf(received_phase);

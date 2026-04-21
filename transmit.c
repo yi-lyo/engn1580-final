@@ -49,7 +49,7 @@
 #define SAMPLE_RATE          48000
 #define FRAMES_PER_BUFFER    256
 #define BUFFERS_PER_SYMBOL   64      /* symbol duration ≈ 341 ms               */
-#define PREAMBLE_SYMBOLS     4       /* phase-0° symbols sent before data       */
+#define PREAMBLE_SYMBOLS     20       /* phase-0° symbols sent before data       */
 
 /* Carrier: exactly 4 cycles per 256-sample buffer → 750 Hz.
  * Because the carrier completes an integer number of cycles per buffer,
