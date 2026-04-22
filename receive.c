@@ -78,8 +78,9 @@
 /* Number of receiver windows used for preamble calibration.
  * Each window is FRAMES_PER_BUFFER samples.  With BUFFERS_PER_SYMBOL=64
  * in the transmitter (symbol = 16384 samples) we get 4 windows/symbol.
- * 8 windows ≈ 2 preamble symbols — plenty for stable phase averaging. */
-#define CAL_WINDOWS              8
+ * 32 windows = 8 preamble symbols — gives receiver ample time to lock
+ * even when started 3-4 seconds after transmitter begins. */
+#define CAL_WINDOWS             32
 
 /* ═══════════════════════════════════════════════════════════════════
  * Window / chart geometry
@@ -153,6 +154,17 @@ static volatile int    s_new_data = 0;
  * ═══════════════════════════════════════════════════════════════════ */
 static float complex exptable[FRAMES_PER_BUFFER];
 
+/* ═══════════════════════════════════════════════════════════════════
+ * Circular audio buffer for symbol-aligned window extraction
+ *   Accumulates all incoming audio samples so we can extract windows
+ *   at positions aligned to detected symbol boundaries.
+ * ═══════════════════════════════════════════════════════════════════ */
+#define SLIDE_BUF_SIZE (FRAMES_PER_BUFFER * 32)  /* 32 windows = 8 symbols */
+static pthread_mutex_t slide_mutex       = PTHREAD_MUTEX_INITIALIZER;
+static float           slide_buf[SLIDE_BUF_SIZE];
+static size_t          slide_write_pos   = 0;
+static size_t          slide_sample_count = 0;  /* total samples written */
+
 typedef struct {
     size_t callback_count;
     size_t max_callback_count;
@@ -202,6 +214,16 @@ static int audio_callback(const void *inputBuffer, void *outputBuffer,
         s_mag      = cabsf(ft);
         s_new_data = 1;
         pthread_mutex_unlock(&s_mutex);
+    }
+
+    /* Append to circular buffer for symbol-aligned extraction */
+    if (pthread_mutex_trylock(&slide_mutex) == 0) {
+        for (size_t i = 0; i < FRAMES_PER_BUFFER; i++) {
+            slide_buf[slide_write_pos] = mic[i];
+            slide_write_pos = (slide_write_pos + 1) % SLIDE_BUF_SIZE;
+        }
+        slide_sample_count += FRAMES_PER_BUFFER;
+        pthread_mutex_unlock(&slide_mutex);
     }
 
     callback_data_t *ud = (callback_data_t *)userData;
@@ -1439,6 +1461,20 @@ int main(int argc, char *argv[])
         float ft_prev_re    = 0.0f;
         float ft_prev_im    = 0.0f;
 
+        /* ── Symbol-aligned window extraction ────────────────────────
+         *
+         * last_boundary_sample — absolute sample position when the most
+         *                        recent boundary was detected.
+         * use_aligned_windows  — enable aligned extraction after first
+         *                        boundary is detected.
+         *
+         * When timing is locked, we extract windows at symbol-aligned
+         * positions: last_boundary_sample + (sym_window × 4096)
+         * This ensures we decode from the true middle of each symbol.
+         */
+        size_t last_boundary_sample = 0;
+        int    use_aligned_windows   = 0;
+
         /* ── Carrier PLL state ──────────────────────────────────────
          *
          * pll_error_deg — most recent phase error (degrees) used to
@@ -1512,6 +1548,51 @@ int main(int argc, char *argv[])
             float received_phase    = atan2f(local_ft_im, local_ft_re);
             float carrier_phase_deg = received_phase * 180.0f / (float)M_PI;
 
+            /* ── Symbol-aligned window extraction ───────────────────
+             *
+             * If timing is locked and aligned extraction is enabled,
+             * extract a window from the circular buffer at the proper
+             * symbol-aligned position and recompute the carrier DFT.
+             *
+             * This solves the fundamental issue: PortAudio windows have
+             * arbitrary timing with no relation to symbol boundaries.
+             */
+            if (use_aligned_windows && timing_locked && sym_window == 2) {
+                /* Calculate target sample position - always extract window 2
+                 * (the 3rd window after boundary, which is in the middle of the symbol) */
+                size_t target_offset = 2 * FRAMES_PER_BUFFER;
+                size_t target_sample = last_boundary_sample + target_offset;
+
+                pthread_mutex_lock(&slide_mutex);
+                
+                /* Check if buffer contains enough data */
+                if (slide_sample_count >= target_sample + FRAMES_PER_BUFFER) {
+                    /* Extract window from circular buffer */
+                    size_t samples_back = slide_sample_count - target_sample;
+                    size_t read_start = (slide_write_pos + SLIDE_BUF_SIZE - samples_back) % SLIDE_BUF_SIZE;
+                    
+                    float aligned_window[FRAMES_PER_BUFFER];
+                    for (size_t i = 0; i < FRAMES_PER_BUFFER; i++) {
+                        aligned_window[i] = slide_buf[(read_start + i) % SLIDE_BUF_SIZE];
+                    }
+                    
+                    /* Recompute DFT on aligned window */
+                    float complex ft_aligned = 0.0f;
+                    for (size_t i = 0; i < FRAMES_PER_BUFFER; i++) {
+                        ft_aligned += aligned_window[i] * exptable[i];
+                    }
+                    
+                    /* Update carrier values with aligned measurements */
+                    local_ft_re = crealf(ft_aligned);
+                    local_ft_im = cimagf(ft_aligned);
+                    carrier_mag = cabsf(ft_aligned);
+                    received_phase = atan2f(local_ft_im, local_ft_re);
+                    carrier_phase_deg = received_phase * 180.0f / (float)M_PI;
+                }
+                
+                pthread_mutex_unlock(&slide_mutex);
+            }
+
             /* ═══════════════════════════════════════════════════════
              * TIMING RECOVERY  —  symbol boundary detection
              * ═══════════════════════════════════════════════════════
@@ -1541,9 +1622,15 @@ int main(int argc, char *argv[])
                 float complex ft_curr = local_ft_re + I * local_ft_im;
                 float complex ft_prev = ft_prev_re  + I * ft_prev_im;
 
-                /* Only run comparator when both windows have signal */
-                if (carrier_mag > SIG_THRESHOLD &&
-                    cabsf(ft_prev) > SIG_THRESHOLD) {
+                /* Run the comparator whenever the current window has a
+                 * detected carrier — using the same SNR-inclusive gate as
+                 * the calibration / decoding state machine.  The previous
+                 * window only needs to exceed the low absolute floor
+                 * (PSK_SIG_THRESHOLD) to be a valid phase reference; we
+                 * cannot check its SNR retrospectively. */
+                
+                if ((snr_db >= CARRIER_SNR_MIN_DB || carrier_mag > SIG_THRESHOLD) &&
+                    cabsf(ft_prev) > 0.5f) {
 
                     float complex delta = ft_curr * conjf(ft_prev);
                     float dp = atan2f(cimagf(delta), crealf(delta));
@@ -1553,6 +1640,16 @@ int main(int argc, char *argv[])
                         /* Symbol boundary detected in this window */
                         is_boundary   = 1;
                         sym_window    = 0;
+                        
+                        /* Update boundary position for aligned window extraction
+                         * This happens on EVERY boundary so we track the current symbol */
+                        pthread_mutex_lock(&slide_mutex);
+                        last_boundary_sample = slide_sample_count - FRAMES_PER_BUFFER;
+                        pthread_mutex_unlock(&slide_mutex);
+                        
+                        if (!timing_locked) {
+                            use_aligned_windows = 1;
+                        }
                         timing_locked = 1;
                     } else {
                         is_boundary = 0;
@@ -1569,7 +1666,7 @@ int main(int argc, char *argv[])
                 ft_prev_im = local_ft_im;
             }
 
-            /* ── Reset accumulator on first timing lock ───────────
+            /* ── Reset accumulator on first timing lock ───────────────
              *
              * Before timing_locked becomes 1 the accumulator samples
              * every post-calibration window, including the remaining
@@ -1645,7 +1742,8 @@ int main(int argc, char *argv[])
             /* Carrier present when SNR is clearly above noise floor
              * (primary OTA criterion) OR the signal exceeds the old
              * absolute floor (preserves software-loopback behaviour). */
-            if (snr_db >= CARRIER_SNR_MIN_DB || carrier_mag > SIG_THRESHOLD) {
+            
+           if (snr_db >= CARRIER_SNR_MIN_DB || carrier_mag > SIG_THRESHOLD) {
 
                 /* Transition from WAITING: begin calibration */
                 if (rx_state == 0) {
@@ -1843,7 +1941,10 @@ int main(int argc, char *argv[])
                 fec_sym_len        = 0;
                 fec_sym_bits       = 0;   /* reset for next transmission */
                 prev_timing_locked = 0;   /* allow re-lock on next preamble */
+                timing_locked      = 0;   /* reset timing lock state */
+                sym_window         = -1;  /* reset window tracking */
                 skip_after_lock    = 0;
+                use_aligned_windows = 0;  /* disable aligned extraction */
             }
 
             /* ── live preview rebuild ──────────────────────────────

@@ -58,12 +58,12 @@
  * without any inter-buffer continuity bookkeeping. */
 #define CARRIER_CYCLES       4
 
-/* Preamble length increased to 8 symbols (≈ 2.73 s) so that even when
- * the receiver starts up to 2 s after the transmitter, calibration
+/* Preamble length increased to 16 symbols (≈ 5.46 s) so that even when
+ * the receiver starts up to 4 s after the transmitter, calibration
  * always lands entirely within the zero-phase preamble region and
  * never accidentally captures the 180° alignment marker. */
 #undef  PREAMBLE_SYMBOLS
-#define PREAMBLE_SYMBOLS     8
+#define PREAMBLE_SYMBOLS    16
 
 static const float TWO_PI          = 2.0f * (float)M_PI;
 static const float TWO_PI_FC_OVER_N =

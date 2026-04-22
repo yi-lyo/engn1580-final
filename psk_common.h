@@ -74,7 +74,7 @@
 #define PSK_CARRIER_BIN         64    /* DFT bin in RX window → 750 Hz       */
 #define PSK_BUFFERS_PER_SYMBOL  64    /* TX buffers per symbol = 16 384 samp */
 #define PSK_SYM_WINDOWS          4    /* RX windows per symbol (exact)       */
-#define PSK_PREAMBLE_SYMBOLS     4    /* phase-0° symbols prepended to data  */
+#define PSK_PREAMBLE_SYMBOLS    16    /* phase-0° symbols prepended to data  */
 
 /* Derived: total audio samples for one symbol */
 #define PSK_SAMPLES_PER_SYMBOL  \
@@ -103,9 +103,10 @@
 /*
  * PSK_CAL_WINDOWS
  *   Number of receiver windows averaged for preamble phase calibration.
- *   = 2 preamble symbols × PSK_SYM_WINDOWS windows/symbol.
+ *   = 8 preamble symbols × PSK_SYM_WINDOWS windows/symbol = 32 windows.
+ *   Uses first half of 16-symbol preamble for calibration.
  */
-#define PSK_CAL_WINDOWS      8
+#define PSK_CAL_WINDOWS     32
 
 /*
  * PSK_PLL_ALPHA
