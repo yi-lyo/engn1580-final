@@ -1752,6 +1752,33 @@ int main(int argc, char *argv[])
                     cal_sin   = 0.0f;
                     cal_mag   = 0.0f;
                     cal_count = 0;
+                    
+                    /* Reset timing recovery phase history to prevent stale
+                     * noise data from before transmission from causing false
+                     * boundary detections on the first preamble window. */
+                    ft_prev_re = 0.0f;
+                    ft_prev_im = 0.0f;
+                    
+                    /* Reset circular buffer to clear stale noise data from
+                     * before this transmission started. This ensures the
+                     * sliding buffer only contains samples from the current
+                     * transmission, preventing corruption from old noise. */
+                    pthread_mutex_lock(&slide_mutex);
+                    slide_sample_count = 0;
+                    slide_write_pos    = 0;
+                    memset(slide_buf, 0, sizeof(slide_buf));
+                    pthread_mutex_unlock(&slide_mutex);
+                    
+                    /* Reset timing recovery state to prevent noise-induced
+                     * false locks from before transmission from persisting.
+                     * Without this, if timing locked onto noise while in
+                     * WAITING state, those stale values would corrupt the
+                     * new transmission's symbol alignment. */
+                    timing_locked = 0;
+                    use_aligned_windows = 0;
+                    sym_window = -1;
+                    last_boundary_sample = 0;
+                    is_boundary = 0;
                 }
 
                 if (rx_state == 1) {
@@ -1831,7 +1858,14 @@ int main(int argc, char *argv[])
                  * their respective floors): abort calibration so the
                  * preamble is recaptured cleanly on the next transmission.
                  * DECODING is preserved across brief signal gaps. */
-                if (rx_state == 1) rx_state = 0;
+                if (rx_state == 1) {
+                    rx_state = 0;
+                    /* Reset aligned extraction flag to prevent stale state from
+                     * noise-induced false locks from affecting next transmission */
+                    use_aligned_windows = 0;
+                    timing_locked = 0;
+                    sym_window = -1;
+                }
                 is_boundary = 0;
             }
 
@@ -1945,6 +1979,17 @@ int main(int argc, char *argv[])
                 sym_window         = -1;  /* reset window tracking */
                 skip_after_lock    = 0;
                 use_aligned_windows = 0;  /* disable aligned extraction */
+                
+                /* Reset circular buffer state to prevent stale noise data
+                 * and arithmetic overflow from persisting across transmissions.
+                 * Without this reset, slide_sample_count grows unbounded and
+                 * can cause incorrect buffer position calculations when a new
+                 * transmission starts after the receiver has been idle. */
+                pthread_mutex_lock(&slide_mutex);
+                slide_sample_count = 0;
+                slide_write_pos    = 0;
+                memset(slide_buf, 0, sizeof(slide_buf));
+                pthread_mutex_unlock(&slide_mutex);
             }
 
             /* ── live preview rebuild ──────────────────────────────
