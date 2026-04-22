@@ -90,9 +90,15 @@
 /*
  * PSK_SIG_THRESHOLD
  *   Minimum |DFT[CARRIER_BIN]| required to consider the carrier present.
- *   A full-scale sine gives |DFT| = N/2 = 2048; threshold = 150 ≈ 7%.
+ *   A full-scale sine gives |DFT| = N/2 = 2048; threshold = 10 ≈ 0.5%.
+ *
+ *   This low absolute floor supports over-the-air reception where physical
+ *   speaker→microphone paths attenuate the signal to well below 7% of
+ *   full scale.  False positives are prevented by the SNR-based gate
+ *   (CARRIER_SNR_MIN_DB) in receive.c, which requires the carrier to be
+ *   clearly above the noise floor regardless of its absolute level.
  */
-#define PSK_SIG_THRESHOLD   150.0f
+#define PSK_SIG_THRESHOLD   10.0f
 
 /*
  * PSK_CAL_WINDOWS

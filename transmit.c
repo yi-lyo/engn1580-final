@@ -58,6 +58,13 @@
  * without any inter-buffer continuity bookkeeping. */
 #define CARRIER_CYCLES       4
 
+/* Preamble length increased to 8 symbols (≈ 2.73 s) so that even when
+ * the receiver starts up to 2 s after the transmitter, calibration
+ * always lands entirely within the zero-phase preamble region and
+ * never accidentally captures the 180° alignment marker. */
+#undef  PREAMBLE_SYMBOLS
+#define PREAMBLE_SYMBOLS     8
+
 static const float TWO_PI          = 2.0f * (float)M_PI;
 static const float TWO_PI_FC_OVER_N =
     2.0f * (float)M_PI * CARRIER_CYCLES / FRAMES_PER_BUFFER;
@@ -293,15 +300,43 @@ int main(int argc, char *argv[])
         return 1;
     }
 
-    /* ── build full symbol array: preamble (symbol 0) + data ─────── */
-    size_t   n_total  = (size_t)PREAMBLE_SYMBOLS + n_data;
+    /* ── build full symbol array: preamble + alignment marker + data ─
+     *
+     * Layout
+     * ──────
+     * Indices 0 … PREAMBLE_SYMBOLS-1  : phase 0°  (8 calibration symbols)
+     * Index   PREAMBLE_SYMBOLS        : phase 180° = symbol M/2
+     *                                   (alignment marker — separate from
+     *                                    preamble so calibration never
+     *                                    captures the wrong phase)
+     * Indices PREAMBLE_SYMBOLS+1 …    : Gray-coded data symbols
+     *
+     * Why the marker is placed AFTER the preamble
+     * ────────────────────────────────────────────
+     * With sleep 1 between transmitter and receiver start, the carrier
+     * arrives ≈ 3 symbols into the transmission.  If the marker were
+     * the last preamble symbol (index PREAMBLE_SYMBOLS-1), calibration
+     * would land on the 180° marker and produce a wrong phase offset
+     * (observed: 51.8° instead of the correct −90°).
+     *
+     * By placing the marker after all 8 zero-phase preamble symbols,
+     * even a receiver that starts 2 s late calibrates entirely within
+     * the zero-phase region and gets phase_offset = −90° reliably.
+     *
+     * The receiver detects the 0°→180° jump, sets timing_locked,
+     * and uses skip_after_lock=1 to discard the marker before
+     * accumulating data bits.
+     */
+    size_t   n_total  = (size_t)PREAMBLE_SYMBOLS + 1 + n_data;
     uint8_t *all_syms = calloc(n_total, 1);   /* calloc zeroes preamble */
     if (!all_syms) {
         fprintf(stderr, "Error: allocation failed for symbol array.\n");
         free(data_syms);
         return 1;
     }
-    memcpy(all_syms + PREAMBLE_SYMBOLS, data_syms, n_data);
+    /* Alignment marker immediately after the all-zero preamble */
+    all_syms[PREAMBLE_SYMBOLS] = (uint8_t)(M / 2);
+    memcpy(all_syms + PREAMBLE_SYMBOLS + 1, data_syms, n_data);
     free(data_syms);
 
     float tx_seconds = (float)n_total
@@ -309,7 +344,8 @@ int main(int argc, char *argv[])
                      * FRAMES_PER_BUFFER
                      / SAMPLE_RATE;
     fprintf(stderr,
-            "Transmitting %d preamble + %zu data symbols  (%.1f s total).\n",
+            "Transmitting %d preamble + 1 marker + %zu data symbols"
+            "  (%.1f s total).\n",
             PREAMBLE_SYMBOLS, n_data, tx_seconds);
 
     /* ── PortAudio ────────────────────────────────────────────────── */

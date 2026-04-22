@@ -58,8 +58,22 @@
 #define CARRIER_BIN              64
 
 /* Carrier DFT magnitude for a full-scale sine wave ≈ FRAMES_PER_BUFFER/2.
- * We treat the carrier as present when magnitude exceeds SIG_THRESHOLD. */
-#define SIG_THRESHOLD            150.0f
+ * SIG_THRESHOLD is a low absolute floor (≈ 1% of full scale) so that
+ * over-the-air reception works even when the acoustic path attenuates
+ * the signal well below the software-loopback level.
+ *
+ * False positives are blocked by CARRIER_SNR_MIN_DB: the carrier bin
+ * must also be at least 6 dB above the mean noise floor before the
+ * receiver enters calibration.  This SNR gate is scale-independent and
+ * is the primary carrier-present criterion for OTA use.
+ */
+#define SIG_THRESHOLD            20.0f
+
+/* Minimum carrier SNR (dB) to consider the carrier present.
+ * Uses the snr_db value already computed from the FFT magnitude array.
+ * 6 dB ≈ carrier power 4× the average noise-bin power — clearly visible
+ * in the FFT display while still rejecting broadband noise. */
+#define CARRIER_SNR_MIN_DB       6.0f
 
 /* Number of receiver windows used for preamble calibration.
  * Each window is FRAMES_PER_BUFFER samples.  With BUFFERS_PER_SYMBOL=64
@@ -115,7 +129,7 @@
 #define IQ_HISTORY 200  /* frames of phase history (~16 s at ~12 Hz) */
 
 /* ═══════════════════════════════════════════════════════════════════
- * IQ history point  (normalised to unit circle)
+ * IQ history point
  *   is_bnd = 1 when this point was captured during a boundary window
  *   (the window that straddles two symbols).  These points are drawn
  *   in a different colour so the user can see the inter-symbol smear.
@@ -355,7 +369,7 @@ static void render_iq_panel(SDL_Renderer *ren, TTF_Font *font,
             Uint8 alpha = (Uint8)(t * t * 225.0f);
             if (alpha < 6) continue;
 
-            /* Unit-circle point → screen coordinates (y flipped) */
+            /* Point → screen coordinates (y flipped) */
             int px = cx + (int)(hist[idx].re * (float)plot_r);
             int py = cy - (int)(hist[idx].im * (float)plot_r);
 
@@ -1346,6 +1360,20 @@ int main(int argc, char *argv[])
                                             * would skip bits 2-7 of every byte */
         int      prev_timing_locked = 0;   /* detect the first timing-lock edge */
 
+        /* skip_after_lock: how many symbol boundaries to ignore before
+         * the accumulator starts saving data bits.
+         *
+         * Set to 1 when timing first locks so that the alignment marker
+         * (last preamble symbol, phase 180°) is discarded and the
+         * accumulator begins exactly at the first TRUE data symbol.
+         *
+         * Decremented each time a new symbol boundary is detected while
+         * timing is already locked, giving the marker one full symbol
+         * period of grace regardless of when the boundary falls within
+         * the receiver window.
+         */
+        int      skip_after_lock = 0;
+
         /* ── Decoded-output live preview ───────────────────────────
          *
          * preview_buf holds the printable representation of every byte
@@ -1372,7 +1400,7 @@ int main(int argc, char *argv[])
         size_t   fec_sym_len     = 0;      /* bytes used               */
         int      fec_corrections = 0;      /* running correction count */
 
-        /* IQ history (unit-circle calibrated carrier phasors) */
+        /* IQ history (calibrated carrier phasors) */
         IQ_Point iq_hist[IQ_HISTORY];
         int      iq_head  = 0;
         int      iq_count = 0;
@@ -1383,7 +1411,9 @@ int main(int argc, char *argv[])
         float cal_cos      = 0.0f;    /* phase-average accumulators            */
         float cal_sin      = 0.0f;
         int   cal_count    = 0;
+        float cal_mag      = 0.0f;
         float phase_offset = 0.0f;    /* calibrated phase reference (radians)  */
+        float ref_mag      = 1.0f;    /* calibrated reference magnitude        */
         int   current_sym  = 0;
         int   current_bits = 0;
 
@@ -1553,17 +1583,31 @@ int main(int argc, char *argv[])
              * at position 0, cleanly byte-aligned.
              */
             if (timing_locked && !prev_timing_locked) {
-                fec_sym_len  = 0;
-                fec_sym_bits = 0;
+                /* First timing lock: preamble → alignment marker boundary.
+                 * Reset accumulator so preamble bits are discarded, and
+                 * arm the skip counter to ignore the marker symbol itself. */
+                fec_sym_len     = 0;
+                fec_sym_bits    = 0;
+                skip_after_lock = 1;
                 if (fec_sym_buf) memset(fec_sym_buf, 0, fec_sym_cap);
 
-                /* Reset live preview too so preamble zeros don't show */
+                /* Reset live preview so preamble zeros don't show */
                 preview_chars   = 0;
                 preview_bytes   = 0;
                 preview_corr    = 0;
                 preview_src_len = 0;
                 memset(preview_buf, 0, sizeof(preview_buf));
             }
+
+            /* Decrement skip counter on each subsequent symbol boundary
+             * (i.e. when timing was already locked in the previous frame).
+             * This gives the alignment marker exactly one symbol period
+             * before the accumulator opens for data. */
+            if (is_boundary && timing_locked && prev_timing_locked
+                && skip_after_lock > 0) {
+                skip_after_lock--;
+            }
+
             prev_timing_locked = timing_locked;
 
             /* ═══════════════════════════════════════════════════════
@@ -1598,13 +1642,17 @@ int main(int argc, char *argv[])
              * It converges to the true offset with a time constant
              * of roughly  1 / PLL_ALPHA  frames ≈ 40 frames ≈ 3 s.
              * ═══════════════════════════════════════════════════════ */
-            if (carrier_mag > SIG_THRESHOLD) {
+            /* Carrier present when SNR is clearly above noise floor
+             * (primary OTA criterion) OR the signal exceeds the old
+             * absolute floor (preserves software-loopback behaviour). */
+            if (snr_db >= CARRIER_SNR_MIN_DB || carrier_mag > SIG_THRESHOLD) {
 
                 /* Transition from WAITING: begin calibration */
                 if (rx_state == 0) {
                     rx_state  = 1;
                     cal_cos   = 0.0f;
                     cal_sin   = 0.0f;
+                    cal_mag   = 0.0f;
                     cal_count = 0;
                 }
 
@@ -1615,12 +1663,14 @@ int main(int argc, char *argv[])
                      * mixed boundary window averages correctly. */
                     cal_cos += cosf(received_phase);
                     cal_sin += sinf(received_phase);
+                    cal_mag += carrier_mag;
                     if (++cal_count >= CAL_WINDOWS) {
                         phase_offset = atan2f(cal_sin, cal_cos);
+                        ref_mag      = cal_mag / (float)CAL_WINDOWS;
                         rx_state     = 2;
                         fprintf(stderr,
-                                "Calibrated.  Phase offset = %.1f°\n",
-                                phase_offset * 180.0f / (float)M_PI);
+                                "Calibrated.  Phase offset = %.1f°, ref_mag = %.1f\n",
+                                phase_offset * 180.0f / (float)M_PI, ref_mag);
                     }
                 }
 
@@ -1657,7 +1707,7 @@ int main(int argc, char *argv[])
                      * do not update the PLL (noisy mixed phase). */
                 }
 
-                /* Store unit-circle phasor in IQ history.
+                /* Store phasor in IQ history.
                  * Both boundary and safe points are stored so the
                  * inter-symbol smear is visible in the constellation;
                  * boundary points are flagged for different colouring. */
@@ -1668,19 +1718,22 @@ int main(int argc, char *argv[])
                     else
                         store_phase = received_phase;
 
-                    IQ_Point p = {cosf(store_phase), sinf(store_phase),
+                    float amp = (rx_state == 2 && ref_mag > 0.0f)
+                              ? carrier_mag / ref_mag
+                              : 1.0f;
+                    IQ_Point p = {amp * cosf(store_phase), amp * sinf(store_phase),
                                   is_boundary};
                     iq_hist[iq_head] = p;
                     iq_head = (iq_head + 1) % IQ_HISTORY;
                     if (iq_count < IQ_HISTORY) iq_count++;
                 }
 
-            } else {
-                /* No carrier: abort calibration so the preamble is
-                 * recaptured cleanly on the next transmission. */
+            } else if (snr_db < CARRIER_SNR_MIN_DB && carrier_mag <= SIG_THRESHOLD) {
+                /* Carrier absent (both SNR and absolute magnitude below
+                 * their respective floors): abort calibration so the
+                 * preamble is recaptured cleanly on the next transmission.
+                 * DECODING is preserved across brief signal gaps. */
                 if (rx_state == 1) rx_state = 0;
-                /* DECODING is preserved across brief signal gaps so
-                 * a momentary dropout does not force recalibration. */
                 is_boundary = 0;
             }
 
@@ -1708,8 +1761,9 @@ int main(int argc, char *argv[])
              *                           recovered bytes.
              */
             if (rx_state == 2 && !is_boundary
-                && carrier_mag > SIG_THRESHOLD
-                && (!timing_locked || sym_window == 2)) {
+                && (snr_db >= CARRIER_SNR_MIN_DB || carrier_mag > SIG_THRESHOLD)
+                && (!timing_locked || sym_window == 2)
+                && skip_after_lock == 0) {
                 int    bps      = ilog2(M);
                 size_t bits_now = fec_sym_bits;   /* exact bit position */
 
@@ -1741,7 +1795,8 @@ int main(int argc, char *argv[])
 
             /* When carrier just dropped: decode accumulated buffer and
              * write output to the -o file (or print preview to stderr). */
-            if (carrier_mag <= SIG_THRESHOLD && fec_sym_len > 0) {
+            if (snr_db < CARRIER_SNR_MIN_DB && carrier_mag <= SIG_THRESHOLD
+                && fec_sym_len > 0) {
                 uint8_t *dec  = NULL;
                 size_t   out_n = 0;
                 int      corr  = 0;
@@ -1788,6 +1843,7 @@ int main(int argc, char *argv[])
                 fec_sym_len        = 0;
                 fec_sym_bits       = 0;   /* reset for next transmission */
                 prev_timing_locked = 0;   /* allow re-lock on next preamble */
+                skip_after_lock    = 0;
             }
 
             /* ── live preview rebuild ──────────────────────────────
