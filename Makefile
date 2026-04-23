@@ -26,7 +26,7 @@ SDL2_CFLAGS  := $(shell pkg-config --cflags sdl2 SDL2_ttf 2>/dev/null)
 SDL2_LIBS    := $(shell pkg-config --libs   sdl2 SDL2_ttf 2>/dev/null)
 LDLIBS_RECEIVE ?= -lportaudio -lm -lpthread $(SDL2_LIBS)
 
-TARGETS := transmit receive test
+TARGETS := transmit receive transmit_cdma receive_cdma test test_cdma
 
 .PHONY: all run clean help
 
@@ -38,9 +38,18 @@ transmit: transmit.c
 receive: receive.c
 	$(CC) $(CFLAGS) $(SDL2_CFLAGS) $(LDFLAGS) -o $@ $< $(LDLIBS_RECEIVE)
 
+transmit_cdma: transmit_cdma.c psk_common.h cdma_common.h
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ transmit_cdma.c $(LDLIBS_TRANSMIT)
+
+receive_cdma: receive_cdma.c psk_common.h cdma_common.h
+	$(CC) $(CFLAGS) $(SDL2_CFLAGS) $(LDFLAGS) -o $@ receive_cdma.c $(LDLIBS_RECEIVE)
+
 # test links only against libm — no PortAudio, no SDL2
 test: test.c psk_common.h
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ test.c $(LDLIBS_TEST)
+
+test_cdma: test_cdma.c cdma_common.h
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ test_cdma.c $(LDLIBS_TEST)
 
 run: transmit
 	./transmit
@@ -55,10 +64,13 @@ clean:
 help:
 	@printf "%s\n" \
 	"Targets:" \
-	"  all (default)  Build ./transmit, ./receive, and ./test" \
+	"  all (default)  Build all executables" \
 	"  transmit       Build only ./transmit" \
 	"  receive        Build only ./receive" \
-	"  test           Build ./test (no PortAudio / SDL2 needed)" \
+	"  transmit_cdma  Build only ./transmit_cdma (CDMA version)" \
+	"  receive_cdma   Build only ./receive_cdma (CDMA version)" \
+	"  test           Build ./test (PSK tests, no PortAudio / SDL2 needed)" \
+	"  test_cdma      Build ./test_cdma (CDMA tests, no PortAudio / SDL2 needed)" \
 	"  run            Build then run ./transmit (pipe data via stdin)" \
 	"  run-tests      Build then run ./test" \
 	"  clean          Remove build artifacts" \
