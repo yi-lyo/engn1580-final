@@ -25,7 +25,7 @@ echo "[Test 1] Quick start (baseline)..."
 OUTPUT_FILE="$TEMP_DIR/quick_output.txt"
 
 # Launch receiver in background with file output
-./receive --device 16 -m 4 -e -d 32 -o "$OUTPUT_FILE" > /dev/null 2>&1 &
+./receive --device 12 -m 32 -e -d 32 -o "$OUTPUT_FILE" &
 RECEIVER_PID=$!
 
 # Small delay to ensure receiver is ready
@@ -33,7 +33,7 @@ sleep 2
 
 # Start transmission immediately
 echo "  Starting transmission (quick)..."
-echo "$TEST_MESSAGE" | ./transmit -m 4 -e -d 32 > /dev/null 2>&1
+echo "$TEST_MESSAGE" | ./transmit -m 32 -e -d 32 > /dev/null 2>&1
 
 # Wait for transmission to complete
 sleep 8
@@ -57,7 +57,7 @@ echo "[Test 2] Delayed start (${DELAY}s wait)..."
 OUTPUT_FILE="$TEMP_DIR/delayed_output.txt"
 
 # Launch receiver in background with file output
-./receive --device 16 -m 4 -e -d 32 -o "$OUTPUT_FILE" > /dev/null 2>&1 &
+./receive --device 12 -m 16 -e -d 32 -o "$OUTPUT_FILE" > /dev/null 2>&1 &
 RECEIVER_PID=$!
 
 # Wait for the specified delay
@@ -66,7 +66,7 @@ sleep "$DELAY"
 
 # Start transmission after delay
 echo "  Starting transmission (delayed)..."
-echo "$TEST_MESSAGE" | ./transmit -m 4 -e -d 32 > /dev/null 2>&1
+echo "$TEST_MESSAGE" | ./transmit -m 16 -e -d 32 > /dev/null 2>&1
 
 # Wait for transmission to complete
 sleep 8

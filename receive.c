@@ -1564,24 +1564,24 @@ int main(int argc, char *argv[])
                 size_t target_sample = last_boundary_sample + target_offset;
 
                 pthread_mutex_lock(&slide_mutex);
-                
+
                 /* Check if buffer contains enough data */
                 if (slide_sample_count >= target_sample + FRAMES_PER_BUFFER) {
                     /* Extract window from circular buffer */
                     size_t samples_back = slide_sample_count - target_sample;
                     size_t read_start = (slide_write_pos + SLIDE_BUF_SIZE - samples_back) % SLIDE_BUF_SIZE;
-                    
+
                     float aligned_window[FRAMES_PER_BUFFER];
                     for (size_t i = 0; i < FRAMES_PER_BUFFER; i++) {
                         aligned_window[i] = slide_buf[(read_start + i) % SLIDE_BUF_SIZE];
                     }
-                    
+
                     /* Recompute DFT on aligned window */
                     float complex ft_aligned = 0.0f;
                     for (size_t i = 0; i < FRAMES_PER_BUFFER; i++) {
                         ft_aligned += aligned_window[i] * exptable[i];
                     }
-                    
+
                     /* Update carrier values with aligned measurements */
                     local_ft_re = crealf(ft_aligned);
                     local_ft_im = cimagf(ft_aligned);
@@ -1589,7 +1589,7 @@ int main(int argc, char *argv[])
                     received_phase = atan2f(local_ft_im, local_ft_re);
                     carrier_phase_deg = received_phase * 180.0f / (float)M_PI;
                 }
-                
+
                 pthread_mutex_unlock(&slide_mutex);
             }
 
@@ -1628,7 +1628,7 @@ int main(int argc, char *argv[])
                  * window only needs to exceed the low absolute floor
                  * (PSK_SIG_THRESHOLD) to be a valid phase reference; we
                  * cannot check its SNR retrospectively. */
-                
+
                 if ((snr_db >= CARRIER_SNR_MIN_DB || carrier_mag > SIG_THRESHOLD) &&
                     cabsf(ft_prev) > 0.5f) {
 
@@ -1640,13 +1640,13 @@ int main(int argc, char *argv[])
                         /* Symbol boundary detected in this window */
                         is_boundary   = 1;
                         sym_window    = 0;
-                        
+
                         /* Update boundary position for aligned window extraction
                          * This happens on EVERY boundary so we track the current symbol */
                         pthread_mutex_lock(&slide_mutex);
                         last_boundary_sample = slide_sample_count - FRAMES_PER_BUFFER;
                         pthread_mutex_unlock(&slide_mutex);
-                        
+
                         if (!timing_locked) {
                             use_aligned_windows = 1;
                         }
@@ -1742,7 +1742,7 @@ int main(int argc, char *argv[])
             /* Carrier present when SNR is clearly above noise floor
              * (primary OTA criterion) OR the signal exceeds the old
              * absolute floor (preserves software-loopback behaviour). */
-            
+
            if (snr_db >= CARRIER_SNR_MIN_DB || carrier_mag > SIG_THRESHOLD) {
 
                 /* Transition from WAITING: begin calibration */
@@ -1752,13 +1752,13 @@ int main(int argc, char *argv[])
                     cal_sin   = 0.0f;
                     cal_mag   = 0.0f;
                     cal_count = 0;
-                    
+
                     /* Reset timing recovery phase history to prevent stale
                      * noise data from before transmission from causing false
                      * boundary detections on the first preamble window. */
                     ft_prev_re = 0.0f;
                     ft_prev_im = 0.0f;
-                    
+
                     /* Reset circular buffer to clear stale noise data from
                      * before this transmission started. This ensures the
                      * sliding buffer only contains samples from the current
@@ -1768,7 +1768,7 @@ int main(int argc, char *argv[])
                     slide_write_pos    = 0;
                     memset(slide_buf, 0, sizeof(slide_buf));
                     pthread_mutex_unlock(&slide_mutex);
-                    
+
                     /* Reset timing recovery state to prevent noise-induced
                      * false locks from before transmission from persisting.
                      * Without this, if timing locked onto noise while in
@@ -1979,7 +1979,7 @@ int main(int argc, char *argv[])
                 sym_window         = -1;  /* reset window tracking */
                 skip_after_lock    = 0;
                 use_aligned_windows = 0;  /* disable aligned extraction */
-                
+
                 /* Reset circular buffer state to prevent stale noise data
                  * and arithmetic overflow from persisting across transmissions.
                  * Without this reset, slide_sample_count grows unbounded and
