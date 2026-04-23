@@ -72,16 +72,16 @@
 #define PSK_FRAMES_PER_BUF_RX  4096   /* receiver analysis window (0x1000)   */
 #define PSK_CARRIER_CYCLES       4    /* cycles per TX buffer → 750 Hz       */
 #define PSK_CARRIER_BIN         64    /* DFT bin in RX window → 750 Hz       */
-#define PSK_BUFFERS_PER_SYMBOL  64    /* TX buffers per symbol = 16 384 samp */
-#define PSK_SYM_WINDOWS          4    /* RX windows per symbol (exact)       */
+#define PSK_BUFFERS_PER_SYMBOL  32    /* TX buffers per symbol = 8 192 samp */
+#define PSK_SYM_WINDOWS          2    /* RX windows per symbol (exact)       */
 #define PSK_PREAMBLE_SYMBOLS    16    /* phase-0° symbols prepended to data  */
 
 /* Derived: total audio samples for one symbol */
 #define PSK_SAMPLES_PER_SYMBOL  \
-    (PSK_BUFFERS_PER_SYMBOL * PSK_FRAMES_PER_BUF_TX)   /* = 16 384 */
+    (PSK_BUFFERS_PER_SYMBOL * PSK_FRAMES_PER_BUF_TX)   /* = 8 192 */
 
 /* Sanity: RX windows per symbol must equal PSK_SYM_WINDOWS */
-/* PSK_SAMPLES_PER_SYMBOL / PSK_FRAMES_PER_BUF_RX = 16384/4096 = 4 ✓ */
+/* PSK_SAMPLES_PER_SYMBOL / PSK_FRAMES_PER_BUF_RX = 8192/4096 = 2 ✓ */
 
 /* ═══════════════════════════════════════════════════════════════════
  * 2. Recovery parameters
@@ -103,10 +103,10 @@
 /*
  * PSK_CAL_WINDOWS
  *   Number of receiver windows averaged for preamble phase calibration.
- *   = 8 preamble symbols × PSK_SYM_WINDOWS windows/symbol = 32 windows.
+ *   = 8 preamble symbols × PSK_SYM_WINDOWS windows/symbol = 16 windows.
  *   Uses first half of 16-symbol preamble for calibration.
  */
-#define PSK_CAL_WINDOWS     32
+#define PSK_CAL_WINDOWS     16
 
 /*
  * PSK_PLL_ALPHA

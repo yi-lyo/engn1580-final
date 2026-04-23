@@ -640,12 +640,6 @@ static void test_timing(void)
         ASSERT_EQ(s.sym_window, 1, "next same-phase: sym_window = 1");
 
         GEN(1.0f); psk_rx_process_window(&s, win, 4);
-        ASSERT_EQ(s.sym_window, 2, "next same-phase: sym_window = 2");
-
-        GEN(1.0f); psk_rx_process_window(&s, win, 4);
-        ASSERT_EQ(s.sym_window, 3, "next same-phase: sym_window = 3");
-
-        GEN(1.0f); psk_rx_process_window(&s, win, 4);
         ASSERT_EQ(s.sym_window, 0, "next same-phase: sym_window wraps to 0");
     }
 
