@@ -18,6 +18,9 @@
  *  8. PLL            — convergence from a known phase error
  *  9. Loopback       — full software channel, zero BER (aligned),
  *                      bounded BER (timing-offset, real-world sim)
+ * 10. Carrier family — cycles↔bin mapping, detection at 4/5/6 cycles
+ * 11. FEC            — Hamming(7,4), interleave, SNR/interference helpers
+ * 12. File I/O       — read/write helpers and file-to-file roundtrip
  *
  * Software channel model
  * ──────────────────────
@@ -520,6 +523,101 @@ static void test_dft(void)
         float complex X_sum = psk_dft_carrier(win_sum);
         float err = cabsf(X_sum - (X_a + X_b));
         ASSERT(err < 1e-2f, "DFT linearity: DFT(a+b) = DFT(a) + DFT(b)");
+    }
+}
+
+/* ═════════════════════════════════════════════════════════════════
+ * 5b. Carrier-family coverage (app-level -c feature support)
+ * ═════════════════════════════════════════════════════════════════ */
+
+/* Local helper: generate one 256-sample TX buffer using an explicit
+ * carrier cycle count (mirrors transmit.c -c behavior). */
+static void gen_tx_buffer_cycles(float *out, int symbol, int M, int carrier_cycles)
+{
+    float phase = (float)symbol * 2.0f * (float)M_PI / (float)M;
+    float tw    = 2.0f * (float)M_PI
+                * (float)carrier_cycles
+                / (float)PSK_FRAMES_PER_BUF_TX;
+    for (int t = 0; t < PSK_FRAMES_PER_BUF_TX; t++)
+        out[t] = sinf(tw * (float)t + phase);
+}
+
+/* Local helper: DFT at an arbitrary bin index. */
+static float complex dft_at_bin(const float *samples, int n, int bin)
+{
+    float complex w  = cexpf(-I * 2.0f * (float)M_PI * (float)bin / (float)n);
+    float complex wt = 1.0f;
+    float complex X  = 0.0f;
+    for (int t = 0; t < n; t++) {
+        X  += samples[t] * wt;
+        wt *= w;
+    }
+    return X;
+}
+
+static void test_carrier_family(void)
+{
+    section("Carrier family: cycles↔bin mapping and detection");
+
+    const int tx_n = PSK_FRAMES_PER_BUF_TX;   /* 256  */
+    const int rx_n = PSK_FRAMES_PER_BUF_RX;   /* 4096 */
+    const int bin_per_cycle = rx_n / tx_n;    /* 16   */
+    const int cycles_list[] = {4, 5, 6};
+    const float half_rx_n = (float)rx_n / 2.0f;
+
+    /* ── cycles/buffer maps to expected RX carrier bin ───────────── */
+    for (int i = 0; i < 3; i++) {
+        int c = cycles_list[i];
+        int bin = c * bin_per_cycle;
+        char lbl[96];
+        snprintf(lbl, sizeof(lbl), "c=%d maps to RX carrier bin %d", c, bin);
+        ASSERT_EQ(bin, c * 16, lbl);
+    }
+
+    /* ── For c in {4,5,6}, energy concentrates at mapped bin ─────── */
+    for (int i = 0; i < 3; i++) {
+        int c = cycles_list[i];
+        int bin = c * bin_per_cycle;
+
+        float win[PSK_FRAMES_PER_BUF_RX];
+        float tw = 2.0f * (float)M_PI * (float)bin / (float)rx_n;
+        for (int t = 0; t < rx_n; t++)
+            win[t] = sinf(tw * (float)t + 0.37f);
+
+        float mag_target = cabsf(dft_at_bin(win, rx_n, bin));
+        float mag_off_p1 = cabsf(dft_at_bin(win, rx_n, bin + 1));
+        float mag_off_m1 = cabsf(dft_at_bin(win, rx_n, bin - 1));
+
+        char lbl_mag[96], lbl_off[96];
+        snprintf(lbl_mag, sizeof(lbl_mag),
+                 "c=%d: |DFT[bin=%d]| ≈ N/2", c, bin);
+        snprintf(lbl_off, sizeof(lbl_off),
+                 "c=%d: adjacent bins are strongly rejected", c);
+
+        ASSERT_NEAR(mag_target, half_rx_n, 1.0f, lbl_mag);
+        ASSERT(mag_off_p1 < 2.0f && mag_off_m1 < 2.0f, lbl_off);
+    }
+
+    /* ── Consecutive RX windows keep phase for each carrier setting ─ */
+    for (int i = 0; i < 3; i++) {
+        int c = cycles_list[i];
+        int bin = c * bin_per_cycle;
+
+        float sym_audio[PSK_SAMPLES_PER_SYMBOL];
+        for (int b = 0; b < PSK_BUFFERS_PER_SYMBOL; b++) {
+            gen_tx_buffer_cycles(sym_audio + b * tx_n, 1, 4, c);
+        }
+
+        float complex X0 = dft_at_bin(sym_audio, rx_n, bin);
+        float complex X1 = dft_at_bin(sym_audio + rx_n, rx_n, bin);
+        float p0 = atan2f(cimagf(X0), crealf(X0));
+        float p1 = atan2f(cimagf(X1), crealf(X1));
+        float diff = atan2f(sinf(p1 - p0), cosf(p1 - p0));
+
+        char lbl[112];
+        snprintf(lbl, sizeof(lbl),
+                 "c=%d: consecutive RX windows keep carrier phase", c);
+        ASSERT_NEAR(diff, 0.0f, 0.001f, lbl);
     }
 }
 
@@ -1674,6 +1772,7 @@ int main(void)
     test_bit_packing();
     test_tx_buffer();
     test_dft();
+    test_carrier_family();
     test_phase_decode();
     test_timing();
     test_pll();

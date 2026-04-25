@@ -9,7 +9,10 @@
 set -e
 
 DELAY=${1:-60}  # Default: 60 second delay
-TEST_MESSAGE="Hello World! This is a test message to verify the delayed start fix works correctly. 123456789"
+TEST_MESSAGE="Hello World! This is a test message to verify the delayed start fix 
+works correctly but I need to make this way way way way way way way longer to 
+witness the stabilisation of the data rate. By the Juice of Sapho, the thoughts
+acquire speed, the lips acquire stains, stains become a warning."
 TEMP_DIR=$(mktemp -d)
 trap "rm -rf $TEMP_DIR" EXIT
 
@@ -25,7 +28,7 @@ echo "[Test 1] Quick start (baseline)..."
 OUTPUT_FILE="$TEMP_DIR/quick_output.txt"
 
 # Launch receiver in background with file output
-./receive --device 12 -m 32 -e -d 32 -o "$OUTPUT_FILE" &
+./receive --device 12 -m 64 -c 12750 -s 64 -k 8 -o "$OUTPUT_FILE" &
 RECEIVER_PID=$!
 
 # Small delay to ensure receiver is ready
@@ -33,7 +36,7 @@ sleep 2
 
 # Start transmission immediately
 echo "  Starting transmission (quick)..."
-echo "$TEST_MESSAGE" | ./transmit -m 32 -e -d 32 > /dev/null 2>&1
+echo "$TEST_MESSAGE" | ./transmit -m 64 -c 12750 -s 64 -k 8 > /dev/null 2>&1
 
 # Wait for transmission to complete
 sleep 8
@@ -57,7 +60,7 @@ echo "[Test 2] Delayed start (${DELAY}s wait)..."
 OUTPUT_FILE="$TEMP_DIR/delayed_output.txt"
 
 # Launch receiver in background with file output
-./receive --device 12 -m 16 -e -d 32 -o "$OUTPUT_FILE" > /dev/null 2>&1 &
+./receive --device 12 -m 16 -c 12750 -e -d 32 -o "$OUTPUT_FILE" > /dev/null 2>&1 &
 RECEIVER_PID=$!
 
 # Wait for the specified delay
@@ -66,7 +69,7 @@ sleep "$DELAY"
 
 # Start transmission after delay
 echo "  Starting transmission (delayed)..."
-echo "$TEST_MESSAGE" | ./transmit -m 16 -e -d 32 > /dev/null 2>&1
+echo "$TEST_MESSAGE" | ./transmit -m 16 -c 12750 -e -d 32 > /dev/null 2>&1
 
 # Wait for transmission to complete
 sleep 8

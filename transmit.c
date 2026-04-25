@@ -18,13 +18,20 @@
  *
  * Usage
  * ─────
- *   echo "Hello" | ./transmit [-m M]
+ *   echo "Hello" | ./transmit [-m M] [-c FREQ_HZ] [-s BUFS]
  *
  *   -m M   PSK order — must be a power of 2, minimum 2.
  *           2  = BPSK  (1 bit/symbol)
  *           4  = QPSK  (2 bits/symbol)   ← default
  *           8  = 8-PSK (3 bits/symbol)
  *          16  = 16-PSK …  etc.
+ *
+ *   -c HZ  carrier frequency in Hz (integer, < 20000)
+ *           Must align with sample timing so the carrier completes
+ *           an integer number of cycles per 256-sample buffer.
+ *
+ *   -s N   TX buffers per symbol (default 64; must be >= 32 and
+ *           divisible by 16 so RX windows per symbol is integer)
  *
  * Timing
  * ──────
@@ -48,7 +55,13 @@
  * ═══════════════════════════════════════════════════════════════════ */
 #define SAMPLE_RATE          48000
 #define FRAMES_PER_BUFFER    256
-#define BUFFERS_PER_SYMBOL   64      /* symbol duration ≈ 341 ms               */
+#define DEFAULT_BUFFERS_PER_SYMBOL 64
+#define MIN_BUFFERS_PER_SYMBOL     32
+#define DEFAULT_CARRIER_CYCLES 4
+#define DEFAULT_NUM_CARRIERS   1
+#define MAX_NUM_CARRIERS       8
+#define CARRIER_SPACING_HZ     750
+#define MAX_CARRIER_HZ       20000
 #define PREAMBLE_SYMBOLS     20       /* phase-0° symbols sent before data       */
 
 /* Carrier: exactly 4 cycles per 256-sample buffer → 750 Hz.
@@ -56,8 +69,6 @@
  * the phase accumulator resets cleanly at every buffer boundary —
  * meaning each buffer can independently specify an absolute carrier phase
  * without any inter-buffer continuity bookkeeping. */
-#define CARRIER_CYCLES       4
-
 /* Preamble length increased to 16 symbols (≈ 5.46 s) so that even when
  * the receiver starts up to 4 s after the transmitter, calibration
  * always lands entirely within the zero-phase preamble region and
@@ -66,8 +77,6 @@
 #define PREAMBLE_SYMBOLS    16
 
 static const float TWO_PI          = 2.0f * (float)M_PI;
-static const float TWO_PI_FC_OVER_N =
-    2.0f * (float)M_PI * CARRIER_CYCLES / FRAMES_PER_BUFFER;
 
 /* ═══════════════════════════════════════════════════════════════════
  * Helper functions
@@ -85,6 +94,64 @@ static int ilog2(int n)
     int k = 0;
     while (n > 1) { n >>= 1; ++k; }
     return k;
+}
+
+static int gcd_int(int a, int b)
+{
+    while (b != 0) {
+        int t = a % b;
+        a = b;
+        b = t;
+    }
+    return (a < 0) ? -a : a;
+}
+
+static int nearest_compatible_hz(int requested_hz)
+{
+    const int step = SAMPLE_RATE / gcd_int(SAMPLE_RATE, FRAMES_PER_BUFFER);
+    const int min_hz = step;
+    const int max_hz = ((MAX_CARRIER_HZ - 1) / step) * step;
+
+    if (requested_hz <= min_hz) return min_hz;
+    if (requested_hz >= max_hz) return max_hz;
+
+    int lower = (requested_hz / step) * step;
+    int upper = lower + step;
+    if (lower < min_hz) lower = min_hz;
+    if (upper > max_hz) upper = max_hz;
+
+    return (requested_hz - lower <= upper - requested_hz) ? lower : upper;
+}
+
+static int parse_carrier_hz(const char *s, int *out_hz)
+{
+    char *ep;
+    long v = strtol(s, &ep, 10);
+    if (*ep != '\0') return 0;
+    if (v <= 0 || v >= MAX_CARRIER_HZ) return 0;
+    *out_hz = (int)v;
+    return 1;
+}
+
+static int parse_buffers_per_symbol(const char *s, int *out_bpsym)
+{
+    char *ep;
+    long v = strtol(s, &ep, 10);
+    if (*ep != '\0') return 0;
+    if (v < MIN_BUFFERS_PER_SYMBOL) return 0;
+    if ((v % 16) != 0) return 0;
+    *out_bpsym = (int)v;
+    return 1;
+}
+
+static int parse_num_carriers(const char *s, int *out_n)
+{
+    char *ep;
+    long v = strtol(s, &ep, 10);
+    if (*ep != '\0') return 0;
+    if (v < 1 || v > MAX_NUM_CARRIERS) return 0;
+    *out_n = (int)v;
+    return 1;
 }
 
 /* Binary-reflected Gray encoding: maps a natural binary index n to the
@@ -106,31 +173,38 @@ static int gray_encode(int n)
  * *out_count is set to the number of symbols produced.
  * Returns NULL on allocation failure.
  * ═══════════════════════════════════════════════════════════════════ */
-static uint8_t *bytes_to_symbols(const uint8_t *data, size_t data_len,
-                                  int bps, size_t *out_count)
+static uint8_t *bytes_to_symbols_mc(const uint8_t *data, size_t data_len,
+                                    int bps, int num_carriers,
+                                    size_t *out_symbol_count)
 {
     size_t total_bits = data_len * 8;
-    size_t n_syms     = (total_bits + (size_t)bps - 1) / (size_t)bps;
+    size_t bits_per_timeslot = (size_t)bps * (size_t)num_carriers;
+    size_t n_symbols = (total_bits + bits_per_timeslot - 1) / bits_per_timeslot;
+    size_t total_syms = n_symbols * (size_t)num_carriers;
 
-    uint8_t *syms = calloc(n_syms, 1);
+    uint8_t *syms = calloc(total_syms, 1);
     if (!syms) return NULL;
 
-    for (size_t s = 0; s < n_syms; s++) {
-        int raw = 0;
-        for (int b = 0; b < bps; b++) {
-            size_t bit_idx = s * (size_t)bps + (size_t)b;
-            int    bit     = 0;
-            if (bit_idx < total_bits) {
-                size_t byte_i = bit_idx / 8;
-                int    bit_i  = 7 - (int)(bit_idx % 8);  /* MSB first */
-                bit = (data[byte_i] >> bit_i) & 1;
+    for (size_t s = 0; s < n_symbols; s++) {
+        for (int c = 0; c < num_carriers; c++) {
+            int raw = 0;
+            for (int b = 0; b < bps; b++) {
+                size_t bit_idx = s * bits_per_timeslot
+                               + (size_t)c * (size_t)bps
+                               + (size_t)b;
+                int bit = 0;
+                if (bit_idx < total_bits) {
+                    size_t byte_i = bit_idx / 8;
+                    int bit_i = 7 - (int)(bit_idx % 8);
+                    bit = (data[byte_i] >> bit_i) & 1;
+                }
+                raw = (raw << 1) | bit;
             }
-            raw = (raw << 1) | bit;
+            syms[s * (size_t)num_carriers + (size_t)c] = (uint8_t)gray_encode(raw);
         }
-        syms[s] = (uint8_t)gray_encode(raw);
     }
 
-    *out_count = n_syms;
+    *out_symbol_count = n_symbols;
     return syms;
 }
 
@@ -142,6 +216,9 @@ typedef struct {
     size_t         n_syms;     /* total number of symbols                  */
     size_t         sym_idx;    /* index of symbol currently being sent     */
     size_t         buf_count;  /* number of buffers sent for current symbol*/
+    int            buffers_per_symbol;
+    int            num_carriers;
+    float          two_pi_fc_over_n[MAX_NUM_CARRIERS];
     int            M;          /* PSK order                                */
 } cb_state_t;
 
@@ -172,15 +249,19 @@ static int audio_callback(const void *inputBuffer, void *outputBuffer,
     if (d->sym_idx >= d->n_syms)
         return paComplete;
 
-    /* Carrier phase for the current symbol */
-    float phase = (float)d->syms[d->sym_idx] * TWO_PI / (float)d->M;
-
     /* Fill the output buffer */
-    for (int t = 0; t < FRAMES_PER_BUFFER; t++)
-        o[t] = sinf(TWO_PI_FC_OVER_N * (float)t + phase);
+    for (int t = 0; t < FRAMES_PER_BUFFER; t++) {
+        float sample = 0.0f;
+        for (int c = 0; c < d->num_carriers; c++) {
+            size_t idx = d->sym_idx * (size_t)d->num_carriers + (size_t)c;
+            float phase = (float)d->syms[idx] * TWO_PI / (float)d->M;
+            sample += sinf(d->two_pi_fc_over_n[c] * (float)t + phase);
+        }
+        o[t] = sample / (float)d->num_carriers;
+    }
 
     /* Advance buffer counter; roll over to next symbol when due */
-    if (++d->buf_count >= BUFFERS_PER_SYMBOL) {
+    if (++d->buf_count >= (size_t)d->buffers_per_symbol) {
         d->buf_count = 0;
         d->sym_idx++;
     }
@@ -199,6 +280,9 @@ int main(int argc, char *argv[])
     int         M          = 4;    /* default: QPSK                   */
     int         fec        = 0;    /* FEC disabled by default         */
     int         depth      = PSK_DEFAULT_ILVE_DEPTH;
+    int         carrier_hz = DEFAULT_CARRIER_CYCLES * SAMPLE_RATE / FRAMES_PER_BUFFER;
+    int         buffers_per_symbol = DEFAULT_BUFFERS_PER_SYMBOL;
+    int         num_carriers = DEFAULT_NUM_CARRIERS;
     const char *input_file = NULL; /* NULL → read from stdin          */
 
     for (int a = 1; a < argc; a++) {
@@ -221,6 +305,51 @@ int main(int argc, char *argv[])
                     M);
                 return 1;
             }
+        } else if (strcmp(argv[a], "-c") == 0) {
+            if (a + 1 >= argc) {
+                fprintf(stderr, "Error: -c requires carrier frequency in Hz.\n");
+                return 1;
+            }
+            if (!parse_carrier_hz(argv[++a], &carrier_hz)) {
+                char *ep;
+                long raw = strtol(argv[a], &ep, 10);
+                fprintf(stderr,
+                        "Error: invalid carrier frequency '%s' Hz (must be integer in 1..%d).\n",
+                        argv[a], MAX_CARRIER_HZ - 1);
+                if (ep != argv[a]) {
+                    int nearest = nearest_compatible_hz((int)raw);
+                    fprintf(stderr,
+                            "       Nearest compatible frequency: %d Hz.\n",
+                            nearest);
+                }
+                fprintf(stderr,
+                        "       Example values: 750, 1125, 1500.\n");
+                return 1;
+            }
+        } else if (strcmp(argv[a], "-s") == 0) {
+            if (a + 1 >= argc) {
+                fprintf(stderr, "Error: -s requires buffers-per-symbol value.\n");
+                return 1;
+            }
+            if (!parse_buffers_per_symbol(argv[++a], &buffers_per_symbol)) {
+                fprintf(stderr,
+                        "Error: invalid -s value '%s' (must be integer >= 32 and divisible by 16).\n",
+                        argv[a]);
+                fprintf(stderr,
+                        "       Example values: 32, 48, 64.\n");
+                return 1;
+            }
+        } else if (strcmp(argv[a], "-k") == 0) {
+            if (a + 1 >= argc) {
+                fprintf(stderr, "Error: -k requires a carrier-count value.\n");
+                return 1;
+            }
+            if (!parse_num_carriers(argv[++a], &num_carriers)) {
+                fprintf(stderr,
+                        "Error: invalid -k value '%s' (must be integer in 1..%d).\n",
+                        argv[a], MAX_NUM_CARRIERS);
+                return 1;
+            }
         } else if (strcmp(argv[a], "-e") == 0) {
             fec = 1;
         } else if (strcmp(argv[a], "-d") == 0) {
@@ -236,21 +365,72 @@ int main(int argc, char *argv[])
         } else {
             fprintf(stderr,
                 "Unknown argument: %s\n"
-                "Usage: %s [-m M] [-e] [-d DEPTH] [-i INPUT_FILE]\n"
+                "Usage: %s [-m M] [-c FREQ_HZ] [-s BUFS] [-k CARRIERS] [-e] [-d DEPTH] [-i INPUT_FILE]\n"
+                "  -c HZ     carrier frequency in Hz (integer, < %d)\n"
+                "  -s N      TX buffers/symbol (>= %d, divisible by 16)\n"
+                "  -k N      number of parallel carriers (1..%d, spacing %d Hz)\n"
                 "  -i FILE   read payload from FILE instead of stdin\n",
-                argv[a], argv[0]);
+                argv[a], argv[0], MAX_CARRIER_HZ, MIN_BUFFERS_PER_SYMBOL,
+                MAX_NUM_CARRIERS, CARRIER_SPACING_HZ);
+            return 1;
+        }
+    }
+
+    if (((long)carrier_hz * FRAMES_PER_BUFFER) % SAMPLE_RATE != 0) {
+        int nearest = nearest_compatible_hz(carrier_hz);
+        fprintf(stderr,
+                "Error: carrier %d Hz is incompatible with %d Hz sample rate and %d-sample TX buffers.\n",
+                carrier_hz, SAMPLE_RATE, FRAMES_PER_BUFFER);
+        fprintf(stderr,
+                "       Choose a frequency where (Hz * %d) is divisible by %d.\n",
+                FRAMES_PER_BUFFER, SAMPLE_RATE);
+        fprintf(stderr,
+                "       Nearest compatible frequency: %d Hz.\n",
+                nearest);
+        fprintf(stderr,
+                "       Examples: 750 Hz, 1125 Hz, 1500 Hz.\n");
+        return 1;
+    }
+
+    int carrier_cycles = carrier_hz * FRAMES_PER_BUFFER / SAMPLE_RATE;
+    int spacing_cycles = CARRIER_SPACING_HZ * FRAMES_PER_BUFFER / SAMPLE_RATE;
+    for (int c = 0; c < num_carriers; c++) {
+        int hz_c = carrier_hz + c * CARRIER_SPACING_HZ;
+        if (hz_c >= MAX_CARRIER_HZ) {
+            fprintf(stderr,
+                    "Error: -k %d with base carrier %d Hz exceeds %d Hz limit at carrier %d (%d Hz).\n",
+                    num_carriers, carrier_hz, MAX_CARRIER_HZ - 1, c + 1, hz_c);
+            return 1;
+        }
+        if (((long)hz_c * FRAMES_PER_BUFFER) % SAMPLE_RATE != 0) {
+            fprintf(stderr,
+                    "Error: derived carrier %d Hz is incompatible with sample timing.\n",
+                    hz_c);
             return 1;
         }
     }
 
     int bps = ilog2(M);
-    float carrier_hz =
-        (float)CARRIER_CYCLES * SAMPLE_RATE / FRAMES_PER_BUFFER;
+    float actual_carrier_hz =
+        (float)carrier_cycles * SAMPLE_RATE / FRAMES_PER_BUFFER;
+    float raw_rate_bps =
+        (float)(bps * num_carriers) * (float)SAMPLE_RATE
+        / ((float)buffers_per_symbol * (float)FRAMES_PER_BUFFER);
+    float sym_ms = 1000.0f * (float)buffers_per_symbol
+                 * (float)FRAMES_PER_BUFFER / (float)SAMPLE_RATE;
 
     fprintf(stderr,
-            "%d-PSK transmitter — %d bit%s/symbol, carrier %.0f Hz%s\n",
-            M, bps, bps == 1 ? "" : "s", carrier_hz,
+            "%d-PSK transmitter — %d carrier%s, %d bit%s/symbol each, base %.1f Hz, symbol %.1f ms, raw %.1f bps%s\n",
+            M, num_carriers, num_carriers == 1 ? "" : "s",
+            bps, bps == 1 ? "" : "s", actual_carrier_hz,
+            sym_ms, raw_rate_bps,
             fec ? " [FEC on]" : "");
+
+    if (buffers_per_symbol < 64) {
+        fprintf(stderr,
+                "Note: -s %d increases throughput but may raise BER on noisy channels.\n",
+                buffers_per_symbol);
+    }
 
     /* ── read input data (file or stdin) ─────────────────────────── */
     size_t   data_len = 0;
@@ -293,10 +473,10 @@ int main(int argc, char *argv[])
 
     /* ── convert bytes → Gray-coded M-PSK symbols ─────────────────── */
     size_t   n_data;
-    uint8_t *data_syms = bytes_to_symbols(data, data_len, bps, &n_data);
+    uint8_t *data_syms = bytes_to_symbols_mc(data, data_len, bps, num_carriers, &n_data);
     free(data);
     if (!data_syms) {
-        fprintf(stderr, "Error: allocation failed in bytes_to_symbols.\n");
+        fprintf(stderr, "Error: allocation failed in bytes_to_symbols_mc.\n");
         return 1;
     }
 
@@ -328,23 +508,26 @@ int main(int argc, char *argv[])
      * accumulating data bits.
      */
     size_t   n_total  = (size_t)PREAMBLE_SYMBOLS + 1 + n_data;
-    uint8_t *all_syms = calloc(n_total, 1);   /* calloc zeroes preamble */
+    uint8_t *all_syms = calloc(n_total * (size_t)num_carriers, 1);   /* calloc zeroes preamble */
     if (!all_syms) {
         fprintf(stderr, "Error: allocation failed for symbol array.\n");
         free(data_syms);
         return 1;
     }
     /* Alignment marker immediately after the all-zero preamble */
-    all_syms[PREAMBLE_SYMBOLS] = (uint8_t)(M / 2);
-    memcpy(all_syms + PREAMBLE_SYMBOLS + 1, data_syms, n_data);
+    for (int c = 0; c < num_carriers; c++)
+        all_syms[PREAMBLE_SYMBOLS * (size_t)num_carriers + (size_t)c] = (uint8_t)(M / 2);
+    memcpy(all_syms + ((size_t)PREAMBLE_SYMBOLS + 1) * (size_t)num_carriers,
+           data_syms,
+           n_data * (size_t)num_carriers);
     free(data_syms);
 
     float tx_seconds = (float)n_total
-                     * BUFFERS_PER_SYMBOL
+                     * (float)buffers_per_symbol
                      * FRAMES_PER_BUFFER
                      / SAMPLE_RATE;
     fprintf(stderr,
-            "Transmitting %d preamble + 1 marker + %zu data symbols"
+            "Transmitting %d preamble + 1 marker + %zu data symbols/time"
             "  (%.1f s total).\n",
             PREAMBLE_SYMBOLS, n_data, tx_seconds);
 
@@ -357,7 +540,19 @@ int main(int argc, char *argv[])
     }
 
     PaStream  *stream;
-    cb_state_t cb = { all_syms, n_total, 0, 0, M };
+    cb_state_t cb;
+    memset(&cb, 0, sizeof(cb));
+    cb.syms = all_syms;
+    cb.n_syms = n_total;
+    cb.sym_idx = 0;
+    cb.buf_count = 0;
+    cb.buffers_per_symbol = buffers_per_symbol;
+    cb.num_carriers = num_carriers;
+    cb.M = M;
+    for (int c = 0; c < num_carriers; c++) {
+        int cyc = carrier_cycles + c * spacing_cycles;
+        cb.two_pi_fc_over_n[c] = 2.0f * (float)M_PI * (float)cyc / (float)FRAMES_PER_BUFFER;
+    }
 
     pe = Pa_OpenDefaultStream(&stream,
                               0, 1,           /* no input, 1 output channel  */

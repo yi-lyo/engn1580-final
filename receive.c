@@ -52,10 +52,23 @@
 #define SAMPLE_RATE              48000
 #define FRAMES_PER_BUFFER        0x1000          /* 4096 samples/callback  */
 
-/* Carrier: bin 64 in the 4096-sample DFT → 64/4096 × 48000 = 750 Hz.
- * The transmitter uses 4 cycles per 256-sample buffer, which is the same
- * frequency: 4/256 × 48000 = 750 Hz. */
-#define CARRIER_BIN              64
+/* Carrier bin mapping
+ *   transmitter cycles/buffer = c (for 256-sample TX buffer)
+ *   receiver carrier bin       = 16c (for 4096-sample RX window)
+ * Default c=4 → bin 64 → 750 Hz. */
+#define DEFAULT_CARRIER_CYCLES   4
+#define MAX_CARRIER_HZ           20000
+#define CARRIER_BIN_PER_CYCLE   (FRAMES_PER_BUFFER / 256)
+#define MIN_BUFFERS_PER_SYMBOL   32
+#define DEFAULT_NUM_CARRIERS      1
+#define MAX_NUM_CARRIERS          8
+#define CARRIER_SPACING_HZ      750
+
+static int   g_carrier_bin = DEFAULT_CARRIER_CYCLES * CARRIER_BIN_PER_CYCLE;
+static float g_carrier_hz  = 750.0f;
+static int   g_carrier_bins[MAX_NUM_CARRIERS];
+static float g_carrier_hzs[MAX_NUM_CARRIERS];
+static int   g_num_carriers = 1;
 
 /* Carrier DFT magnitude for a full-scale sine wave ≈ FRAMES_PER_BUFFER/2.
  * SIG_THRESHOLD is a low absolute floor (≈ 1% of full scale) so that
@@ -85,15 +98,18 @@
 /* ═══════════════════════════════════════════════════════════════════
  * Window / chart geometry
  * ═══════════════════════════════════════════════════════════════════ */
-#define WIN_W     1130
-#define WIN_H      762   /* includes decoded-output panel at bottom           */
+#define WIN_W     1700
+#define WIN_H     1020   /* includes decoded-output panel at bottom           */
 
 #define CHART_X     50
-#define CHART_Y     46
-#define CHART_W    600   /* = BAR_WIDTH × BAR_PX_W = 100 × 6 */
-#define CHART_H    420
+#define CHART_Y     64
+#define CHART_W    900   /* = BAR_WIDTH × BAR_PX_W = 100 × 9 */
+#define CHART_H    560
 #define BAR_WIDTH  100
-#define BAR_PX_W     6
+#define BAR_PX_W     9
+
+#define FFT_DISPLAY_MIN_HZ 20.0f
+#define FFT_DISPLAY_MAX_HZ 20000.0f
 
 #define AXIS_Y   (CHART_Y + CHART_H +  8)   /* Hz tick labels               */
 #define INFO_Y   (CHART_Y + CHART_H + 34)   /* carrier / decode readout     */
@@ -120,13 +136,12 @@
  *   the phase offset by  α × phase_error  to track slow drift.
  *   Small α ⟹ slow but noise-robust tracking.
  */
-#define SYM_WINDOWS  4
 #define PLL_ALPHA    0.025f
 
 /* ── IQ constellation panel (right of FFT chart) ─────────────────── */
-#define IQ_X      680   /* = CHART_X + CHART_W + 30                  */
-#define IQ_Y       46
-#define IQ_SIZE   400   /* square panel                               */
+#define IQ_X      990   /* = CHART_X + CHART_W + 40                  */
+#define IQ_Y       64
+#define IQ_SIZE   620   /* square panel                               */
 #define IQ_HISTORY 200  /* frames of phase history (~16 s at ~12 Hz) */
 
 /* ═══════════════════════════════════════════════════════════════════
@@ -142,9 +157,9 @@ typedef struct { float re, im; int is_bnd; } IQ_Point;
  * ═══════════════════════════════════════════════════════════════════ */
 static pthread_mutex_t s_mutex    = PTHREAD_MUTEX_INITIALIZER;
 static float           s_samples[FRAMES_PER_BUFFER];
-static float           s_ft_re    = 0.0f;   /* raw complex carrier value */
-static float           s_ft_im    = 0.0f;
-static float           s_mag      = 0.0f;   /* |ft|                      */
+static float           s_ft_re[MAX_NUM_CARRIERS];
+static float           s_ft_im[MAX_NUM_CARRIERS];
+static float           s_mag[MAX_NUM_CARRIERS];
 static volatile int    s_new_data = 0;
 
 /* ═══════════════════════════════════════════════════════════════════
@@ -152,7 +167,7 @@ static volatile int    s_new_data = 0;
  *   exptable[i] = e^{ −i 2π × CARRIER_BIN/N × i }
  *   Inner product with audio gives DFT[CARRIER_BIN].
  * ═══════════════════════════════════════════════════════════════════ */
-static float complex exptable[FRAMES_PER_BUFFER];
+static float complex exptable[MAX_NUM_CARRIERS][FRAMES_PER_BUFFER];
 
 /* ═══════════════════════════════════════════════════════════════════
  * Circular audio buffer for symbol-aligned window extraction
@@ -175,6 +190,64 @@ typedef struct {
  * ═══════════════════════════════════════════════════════════════════ */
 static int is_power_of_2(int n) { return (n >= 2) && ((n & (n - 1)) == 0); }
 static int ilog2(int n)          { int k = 0; while (n > 1) { n >>= 1; k++; } return k; }
+
+static int gcd_int(int a, int b)
+{
+    while (b != 0) {
+        int t = a % b;
+        a = b;
+        b = t;
+    }
+    return (a < 0) ? -a : a;
+}
+
+static int nearest_compatible_hz(int requested_hz)
+{
+    const int step = SAMPLE_RATE / gcd_int(SAMPLE_RATE, 256);
+    const int min_hz = step;
+    const int max_hz = ((MAX_CARRIER_HZ - 1) / step) * step;
+
+    if (requested_hz <= min_hz) return min_hz;
+    if (requested_hz >= max_hz) return max_hz;
+
+    int lower = (requested_hz / step) * step;
+    int upper = lower + step;
+    if (lower < min_hz) lower = min_hz;
+    if (upper > max_hz) upper = max_hz;
+
+    return (requested_hz - lower <= upper - requested_hz) ? lower : upper;
+}
+
+static int parse_carrier_hz(const char *s, int *out_hz)
+{
+    char *ep;
+    long v = strtol(s, &ep, 10);
+    if (*ep != '\0') return 0;
+    if (v <= 0 || v >= MAX_CARRIER_HZ) return 0;
+    *out_hz = (int)v;
+    return 1;
+}
+
+static int parse_buffers_per_symbol(const char *s, int *out_bpsym)
+{
+    char *ep;
+    long v = strtol(s, &ep, 10);
+    if (*ep != '\0') return 0;
+    if (v < MIN_BUFFERS_PER_SYMBOL) return 0;
+    if ((v % 16) != 0) return 0;
+    *out_bpsym = (int)v;
+    return 1;
+}
+
+static int parse_num_carriers(const char *s, int *out_n)
+{
+    char *ep;
+    long v = strtol(s, &ep, 10);
+    if (*ep != '\0') return 0;
+    if (v < 1 || v > MAX_NUM_CARRIERS) return 0;
+    *out_n = (int)v;
+    return 1;
+}
 
 /* Gray decode: convert Gray code word back to natural binary */
 static int gray_decode(int g)
@@ -202,16 +275,20 @@ static int audio_callback(const void *inputBuffer, void *outputBuffer,
 
     const float *mic = (const float *)inputBuffer;
 
-    /* DFT[CARRIER_BIN] via inner product with precomputed phasor */
-    float complex ft = 0.0f;
-    for (size_t i = 0; i < FRAMES_PER_BUFFER; i++)
-        ft += mic[i] * exptable[i];
+    float complex ft[MAX_NUM_CARRIERS];
+    for (int c = 0; c < g_num_carriers; c++) {
+        ft[c] = 0.0f;
+        for (size_t i = 0; i < FRAMES_PER_BUFFER; i++)
+            ft[c] += mic[i] * exptable[c][i];
+    }
 
     if (pthread_mutex_trylock(&s_mutex) == 0) {
         memcpy(s_samples, mic, FRAMES_PER_BUFFER * sizeof(float));
-        s_ft_re    = crealf(ft);
-        s_ft_im    = cimagf(ft);
-        s_mag      = cabsf(ft);
+        for (int c = 0; c < g_num_carriers; c++) {
+            s_ft_re[c] = crealf(ft[c]);
+            s_ft_im[c] = cimagf(ft[c]);
+            s_mag[c] = cabsf(ft[c]);
+        }
         s_new_data = 1;
         pthread_mutex_unlock(&s_mutex);
     }
@@ -234,9 +311,8 @@ static int audio_callback(const void *inputBuffer, void *outputBuffer,
 /* ───────────────────────────────────────────────────────────────────
  * compute_dft
  *
- * Fills magnitudes[0 … BAR_WIDTH−1] with |X[k]| / n.
- * Uses incremental twiddle factors: one cexpf per bin, one complex
- * multiply per sample — avoids cexpf in the hot inner loop.
+ * Analysis DFT for bins [0 … BAR_WIDTH-1].
+ * Used by SNR/interference stats and demod support logic.
  * ─────────────────────────────────────────────────────────────────── */
 static void compute_dft(const float *samples, size_t n, float *magnitudes)
 {
@@ -253,10 +329,42 @@ static void compute_dft(const float *samples, size_t n, float *magnitudes)
 }
 
 /* ───────────────────────────────────────────────────────────────────
+ * compute_display_spectrum
+ *
+ * Fills display_mag[0 … BAR_WIDTH-1] by sampling the spectrum over
+ * 20 Hz … 20 kHz (linear in frequency) so the chart spans the
+ * audible range instead of just the first 100 DFT bins.
+ * ─────────────────────────────────────────────────────────────────── */
+static void compute_display_spectrum(const float *samples, size_t n,
+                                     float *display_mag)
+{
+    const float hz_per_bin = (float)SAMPLE_RATE / (float)n;
+    const float span_hz = FFT_DISPLAY_MAX_HZ - FFT_DISPLAY_MIN_HZ;
+
+    for (int i = 0; i < BAR_WIDTH; i++) {
+        float frac = (BAR_WIDTH > 1) ? (float)i / (float)(BAR_WIDTH - 1) : 0.0f;
+        float f_hz = FFT_DISPLAY_MIN_HZ + frac * span_hz;
+        int   bin  = (int)lroundf(f_hz / hz_per_bin);
+
+        if (bin < 0) bin = 0;
+        if (bin > (int)n / 2) bin = (int)n / 2;
+
+        float complex w  = cexpf(-I * 2.0f * M_PI * (float)bin / (float)n);
+        float complex wt = 1.0f;
+        float complex X  = 0.0f;
+        for (size_t t = 0; t < n; t++) {
+            X  += samples[t] * wt;
+            wt *= w;
+        }
+        display_mag[i] = cabsf(X) / (float)n;
+    }
+}
+
+/* ───────────────────────────────────────────────────────────────────
  * draw_text  —  render a UTF-8 string at (x, y) with the given colour
  * ─────────────────────────────────────────────────────────────────── */
 static void draw_text(SDL_Renderer *ren, TTF_Font *font,
-                       const char *text, int x, int y, SDL_Color col)
+                      const char *text, int x, int y, SDL_Color col)
 {
     if (!font || !text || !text[0]) return;
     SDL_Surface *surf = TTF_RenderUTF8_Blended(font, text, col);
@@ -269,6 +377,22 @@ static void draw_text(SDL_Renderer *ren, TTF_Font *font,
     SDL_Rect dst = {x, y, w, h};
     SDL_RenderCopy(ren, tex, NULL, &dst);
     SDL_DestroyTexture(tex);
+}
+
+static SDL_Color carrier_color(int idx)
+{
+    static const SDL_Color palette[MAX_NUM_CARRIERS] = {
+        {255, 210,   0, 255},
+        {255, 120,  40, 255},
+        {200, 110, 255, 255},
+        { 70, 200, 255, 255},
+        {120, 235, 100, 255},
+        {255, 170, 210, 255},
+        {160, 255, 210, 255},
+        {255, 235, 120, 255}
+    };
+    if (idx < 0) idx = 0;
+    return palette[idx % MAX_NUM_CARRIERS];
 }
 
 /* ───────────────────────────────────────────────────────────────────
@@ -318,16 +442,30 @@ static void draw_circle(SDL_Renderer *ren, int cx, int cy, int r)
 static void render_iq_panel(SDL_Renderer *ren, TTF_Font *font,
                              const IQ_Point *hist, int head, int count,
                              int M, int current_sym, int rx_state,
-                             int timing_locked, int sym_window)
+                             int timing_locked, int sym_window,
+                             int panel_x, int panel_y,
+                             int panel_w, int panel_h,
+                             int carrier_idx, float carrier_hz)
 {
-    const int cx     = IQ_X + IQ_SIZE / 2;
-    const int cy     = IQ_Y + IQ_SIZE / 2;
-    const int plot_r = IQ_SIZE / 2 - 18;   /* unit-circle pixel radius     */
+    const int pad = 8;
+    const int top_h = (font ? 24 : 10);
+    const int bottom_h = (panel_h >= 160 ? 38 : 20);
+    int inner_w = panel_w - 2 * pad;
+    int inner_h = panel_h - top_h - bottom_h - 2 * pad;
+    int plot_side = SDL_min(inner_w, inner_h);
+    if (plot_side < 40) return;
+
+    int plot_x = panel_x + (panel_w - plot_side) / 2;
+    int plot_y = panel_y + top_h + pad + (inner_h - plot_side) / 2;
+
+    const int cx     = plot_x + plot_side / 2;
+    const int cy     = plot_y + plot_side / 2;
+    const int plot_r = plot_side / 2 - 10;   /* unit-circle pixel radius     */
     const float two_pi = 2.0f * (float)M_PI;
 
     /* ── background ────────────────────────────────────────────────── */
     SDL_SetRenderDrawColor(ren, 6, 6, 12, 255);
-    SDL_Rect bg = {IQ_X, IQ_Y, IQ_SIZE, IQ_SIZE};
+    SDL_Rect bg = {panel_x, panel_y, panel_w, panel_h};
     SDL_RenderFillRect(ren, &bg);
 
     /* ── reference circles at 25 %, 50 %, 75 %, 100 % ──────────────── */
@@ -337,8 +475,8 @@ static void render_iq_panel(SDL_Renderer *ren, TTF_Font *font,
 
     /* ── crosshair axes ────────────────────────────────────────────── */
     SDL_SetRenderDrawColor(ren, 36, 36, 68, 255);
-    SDL_RenderDrawLine(ren, IQ_X + 6,          cy, IQ_X + IQ_SIZE - 6, cy);
-    SDL_RenderDrawLine(ren, cx, IQ_Y + 6,          cx, IQ_Y + IQ_SIZE - 6);
+    SDL_RenderDrawLine(ren, plot_x + 3, cy, plot_x + plot_side - 3, cy);
+    SDL_RenderDrawLine(ren, cx, plot_y + 3, cx, plot_y + plot_side - 3);
 
     /* ── M reference constellation markers ─────────────────────────── */
     for (int k = 0; k < M; k++) {
@@ -359,7 +497,7 @@ static void render_iq_panel(SDL_Renderer *ren, TTF_Font *font,
         SDL_RenderDrawLine(ren, mx,       my - arm, mx,       my + arm);
 
         /* Bit-pattern label for M ≤ 8 (positioned just outside the ring) */
-        if (font && M <= 8) {
+        if (font && M <= 8 && plot_side >= 180) {
             int bps   = ilog2(M);
             int bits  = gray_decode(k);
             char lbl[16] = {0};
@@ -396,8 +534,8 @@ static void render_iq_panel(SDL_Renderer *ren, TTF_Font *font,
             int py = cy - (int)(hist[idx].im * (float)plot_r);
 
             /* Clamp inside panel */
-            px = SDL_max(IQ_X + 2, SDL_min(IQ_X + IQ_SIZE - 6, px));
-            py = SDL_max(IQ_Y + 2, SDL_min(IQ_Y + IQ_SIZE - 6, py));
+            px = SDL_max(plot_x + 2, SDL_min(plot_x + plot_side - 6, px));
+            py = SDL_max(plot_y + 2, SDL_min(plot_y + plot_side - 6, py));
 
             /* Colour:
              *   amber      — still calibrating (phase offset unknown)
@@ -421,7 +559,12 @@ static void render_iq_panel(SDL_Renderer *ren, TTF_Font *font,
     }
 
     /* ── border ─────────────────────────────────────────────────────── */
-    SDL_SetRenderDrawColor(ren, 55, 55, 90, 255);
+    SDL_Color cc = carrier_color(carrier_idx - 1);
+    SDL_SetRenderDrawColor(ren,
+                           (Uint8)SDL_max((int)cc.r - 80, 40),
+                           (Uint8)SDL_max((int)cc.g - 80, 40),
+                           (Uint8)SDL_max((int)cc.b - 80, 40),
+                           255);
     SDL_RenderDrawRect(ren, &bg);
 
     /* ── labels ─────────────────────────────────────────────────────── */
@@ -429,16 +572,20 @@ static void render_iq_panel(SDL_Renderer *ren, TTF_Font *font,
 
     /* Panel title */
     {
-        char title[32];
-        snprintf(title, sizeof(title), "%d-PSK Constellation", M);
+        char title[64];
+        snprintf(title, sizeof(title), "C%d %.0fHz", carrier_idx, carrier_hz);
         /* Rough centering */
         int tw = (int)strlen(title) * 7;
-        draw_text(ren, font, title, IQ_X + IQ_SIZE / 2 - tw / 2, IQ_Y - 22, lbl);
+        SDL_Color tc = carrier_color(carrier_idx - 1);
+        draw_text(ren, font, title,
+                  panel_x + panel_w / 2 - tw / 2, panel_y + 3, tc);
     }
 
     /* Axis labels */
-    draw_text(ren, font, "I",  IQ_X + IQ_SIZE - 14, cy -  9, lbl);
-    draw_text(ren, font, "Q",  cx + 5,               IQ_Y + 5, lbl);
+    if (plot_side >= 100) {
+        draw_text(ren, font, "I",  plot_x + plot_side - 14, cy -  9, lbl);
+        draw_text(ren, font, "Q",  cx + 5,                  plot_y + 5, lbl);
+    }
 
     /* State indicator */
     {
@@ -450,20 +597,74 @@ static void render_iq_panel(SDL_Renderer *ren, TTF_Font *font,
             rx_state == 0 ? (SDL_Color){ 60,  60,  80, 255} :
             rx_state == 1 ? (SDL_Color){220, 155,   0, 255} :
                             (SDL_Color){  0, 200, 140, 255};
-        draw_text(ren, font, state_str, IQ_X + 6, IQ_Y + IQ_SIZE - 18, sc);
+        draw_text(ren, font, state_str, panel_x + 6, panel_y + panel_h - 18, sc);
     }
 
     /* Timing window indicator (bottom-right of IQ panel) */
-    if (timing_locked) {
+    if (timing_locked && panel_w >= 210) {
         SDL_Color tc = {60, 60, 95, 255};
         char tw_str[32];
-        /* sym_window: 0 = boundary slot, 1-3 = safe slots */
+        /* sym_window: 0 = boundary slot, >0 = safe slots */
         snprintf(tw_str, sizeof(tw_str),
-                 "Win %d/%d  %s",
-                 sym_window, SYM_WINDOWS - 1,
+                 "Win %d  %s",
+                 sym_window,
                  sym_window == 0 ? "(boundary)" : "(safe)");
         draw_text(ren, font, tw_str,
-                  IQ_X + 6, IQ_Y + IQ_SIZE - 34, tc);
+                 panel_x + 6, panel_y + panel_h - 36, tc);
+    }
+}
+
+static void render_iq_panels(SDL_Renderer *ren, TTF_Font *font,
+                              IQ_Point iq_hist[MAX_NUM_CARRIERS][IQ_HISTORY],
+                              int iq_head, int iq_count,
+                              int M, const int *current_sym_c, int rx_state,
+                              int timing_locked, int sym_window,
+                              int num_carriers)
+{
+    const int gap = 8;
+    int best_cols = 1;
+    int best_rows = num_carriers;
+    int best_plot = -1;
+
+    for (int cols = 1; cols <= num_carriers; cols++) {
+        int rows = (num_carriers + cols - 1) / cols;
+        int cell_w = (IQ_SIZE - (cols + 1) * gap) / cols;
+        int cell_h = (IQ_SIZE - (rows + 1) * gap) / rows;
+
+        int inner_w = cell_w - 16;
+        int inner_h = cell_h - 24 - 38 - 16;
+        int plot_side = SDL_min(inner_w, inner_h);
+
+        if (plot_side > best_plot ||
+            (plot_side == best_plot && cols * rows < best_cols * best_rows)) {
+            best_plot = plot_side;
+            best_cols = cols;
+            best_rows = rows;
+        }
+    }
+
+    int cols = best_cols;
+    int rows = best_rows;
+    int cell_w = (IQ_SIZE - (cols + 1) * gap) / cols;
+    int cell_h = (IQ_SIZE - (rows + 1) * gap) / rows;
+
+    for (int c = 0; c < num_carriers; c++) {
+        int row = c / cols;
+        int col = c % cols;
+
+        int row_first = row * cols;
+        int row_items = SDL_min(cols, num_carriers - row_first);
+        int row_offset = (cols - row_items) * (cell_w + gap) / 2;
+
+        int px = IQ_X + gap + row_offset + col * (cell_w + gap);
+        int py = IQ_Y + gap + row * (cell_h + gap);
+
+        render_iq_panel(ren, font,
+                        iq_hist[c], iq_head, iq_count,
+                        M, current_sym_c[c], rx_state,
+                        timing_locked, sym_window,
+                        px, py, cell_w, cell_h,
+                        c + 1, g_carrier_hzs[c]);
     }
 }
 
@@ -648,7 +849,8 @@ static void render_frame(SDL_Renderer *ren, TTF_Font *font,
                           const float *magnitudes, float *peaks,
                           float carrier_mag, float carrier_phase_deg,
                           int current_sym, int current_bits,
-                          int rx_state, int M,
+                          int rx_state, int M, float live_rate_bps,
+                          int sym_windows_cfg, int decode_window_idx,
                           /* timing recovery */
                           int sym_window, int is_boundary, int timing_locked,
                           /* carrier PLL */
@@ -659,8 +861,17 @@ static void render_frame(SDL_Renderer *ren, TTF_Font *font,
                           int fec_enabled, int fec_corrections,
                           int fec_depth)
 {
-    const float hz_per_bin =
-        (float)SAMPLE_RATE / (float)FRAMES_PER_BUFFER;   /* ≈ 11.72 Hz */
+    const float span_hz = FFT_DISPLAY_MAX_HZ - FFT_DISPLAY_MIN_HZ;
+    const float display_hz_per_bar =
+        (BAR_WIDTH > 1) ? span_hz / (float)(BAR_WIDTH - 1) : 0.0f;
+    int carrier_display_bins[MAX_NUM_CARRIERS] = {0};
+    for (int c = 0; c < g_num_carriers; c++) {
+        int bin = (int)lroundf((g_carrier_hzs[c] - FFT_DISPLAY_MIN_HZ)
+                               / display_hz_per_bar);
+        if (bin < 0) bin = 0;
+        if (bin >= BAR_WIDTH) bin = BAR_WIDTH - 1;
+        carrier_display_bins[c] = bin;
+    }
 
     /* ── clear ─────────────────────────────────────────────────────── */
     SDL_SetRenderDrawColor(ren, 14, 14, 22, 255);
@@ -670,14 +881,33 @@ static void render_frame(SDL_Renderer *ren, TTF_Font *font,
     {
         char title[200];
         snprintf(title, sizeof(title),
-                 "FFT Spectrum  —  %.1f Hz/bin   |   "
+                 "FFT Spectrum  —  %.0f..%.0f Hz   |   "
                  "Carrier: bin %d  (~%.0f Hz)   |   "
-                 "%d-PSK  (%d bit%s/symbol)",
-                 hz_per_bin,
-                 CARRIER_BIN, (float)CARRIER_BIN * hz_per_bin,
-                 M, ilog2(M), ilog2(M) == 1 ? "" : "s");
+                 "%d-PSK  (%d bit%s/symbol)  |  %d carrier%s",
+                 FFT_DISPLAY_MIN_HZ, FFT_DISPLAY_MAX_HZ,
+                 g_carrier_bin, g_carrier_hz,
+                 M, ilog2(M), ilog2(M) == 1 ? "" : "s",
+                 g_num_carriers, g_num_carriers == 1 ? "" : "s");
         SDL_Color c = {175, 175, 210, 255};
         draw_text(ren, font, title, CHART_X, 12, c);
+
+        /* Per-carrier color legend */
+        int lx = CHART_X;
+        const int ly = 30;
+        for (int k = 0; k < g_num_carriers; k++) {
+            SDL_Color cc = carrier_color(k);
+            SDL_SetRenderDrawColor(ren, cc.r, cc.g, cc.b, 255);
+            SDL_Rect sw = {lx, ly + 3, 10, 10};
+            SDL_RenderFillRect(ren, &sw);
+
+            char lbuf[40];
+            snprintf(lbuf, sizeof(lbuf), "C%d %.0fHz", k + 1, g_carrier_hzs[k]);
+            SDL_Color lc = {155, 155, 190, 255};
+            draw_text(ren, font, lbuf, lx + 14, ly, lc);
+
+            lx += 92;
+            if (lx > CHART_X + CHART_W - 90) break;
+        }
     }
 
     /* ── chart background ──────────────────────────────────────────── */
@@ -693,9 +923,17 @@ static void render_frame(SDL_Renderer *ren, TTF_Font *font,
     }
 
     /* ── dim dotted guide line at the carrier bin ───────────────────── */
-    SDL_SetRenderDrawColor(ren, 55, 44, 0, 255);
-    for (int dy = CHART_Y; dy < CHART_Y + CHART_H; dy += 3)
-        SDL_RenderDrawPoint(ren, CHART_X + CARRIER_BIN * BAR_PX_W, dy);
+    for (int c = 0; c < g_num_carriers; c++) {
+        int carrier_display_bin = carrier_display_bins[c];
+        SDL_Color cc = carrier_color(c);
+        SDL_SetRenderDrawColor(ren,
+                               (Uint8)SDL_max((int)cc.r / 3, 25),
+                               (Uint8)SDL_max((int)cc.g / 3, 25),
+                               (Uint8)SDL_max((int)cc.b / 3, 25),
+                               255);
+        for (int dy = CHART_Y; dy < CHART_Y + CHART_H; dy += 3)
+            SDL_RenderDrawPoint(ren, CHART_X + carrier_display_bin * BAR_PX_W, dy);
+    }
 
     /* ── normalise bars to the loudest bin in this frame ────────────── */
     float max_mag = 1e-9f;
@@ -704,16 +942,26 @@ static void render_frame(SDL_Renderer *ren, TTF_Font *font,
 
     /* ── bars + peak-hold ───────────────────────────────────────────── */
     for (int k = 0; k < BAR_WIDTH; k++) {
-        int is_carrier = (k == CARRIER_BIN);
+        int carrier_idx = -1;
+        for (int c = 0; c < g_num_carriers; c++) {
+            if (k == carrier_display_bins[c]) {
+                carrier_idx = c;
+                break;
+            }
+        }
 
         float norm  = magnitudes[k] / max_mag;
         int   bar_h = (int)(norm * (float)CHART_H);
         int   bx    = CHART_X + k * BAR_PX_W;
 
-        /* Colour: gold for carrier bin, cyan-green for all others */
+        /* Colour: carrier-coded for any carrier bin, cyan-green for others */
         Uint8 r, g, b;
-        if (is_carrier) { r = 255; g = 210; b =  0; }
-        else            { r =   0; g = 185; b = 90; }
+        if (carrier_idx >= 0) {
+            SDL_Color cc = carrier_color(carrier_idx);
+            r = cc.r; g = cc.g; b = cc.b;
+        } else {
+            r =   0; g = 185; b = 90;
+        }
 
         if (bar_h > 0) {
             SDL_SetRenderDrawColor(ren, r, g, b, 255);
@@ -752,11 +1000,12 @@ static void render_frame(SDL_Renderer *ren, TTF_Font *font,
                                     tx, CHART_Y + CHART_H + 5);
         }
         char buf[32];
-        snprintf(buf, sizeof(buf), "0");
+        snprintf(buf, sizeof(buf), "%.0f Hz", FFT_DISPLAY_MIN_HZ);
         draw_text(ren, font, buf, CHART_X - 2, AXIS_Y, axis_col);
         for (int q = 1; q <= 4; q++) {
-            int   bin  = BAR_WIDTH * q / 4;
-            float freq = (float)bin * hz_per_bin;
+            float freq = FFT_DISPLAY_MIN_HZ
+                       + (FFT_DISPLAY_MAX_HZ - FFT_DISPLAY_MIN_HZ)
+                       * (float)q / 4.0f;
             snprintf(buf, sizeof(buf), "%.0f Hz", freq);
             int tx = CHART_X + CHART_W * q / 4 - 22;
             draw_text(ren, font, buf, tx, AXIS_Y, axis_col);
@@ -885,6 +1134,21 @@ static void render_frame(SDL_Renderer *ren, TTF_Font *font,
             x += 200;
         }
 
+        /* Live data-rate readout */
+        {
+            char rate_buf[64];
+            snprintf(rate_buf, sizeof(rate_buf), "Rate: %6.1f bps", live_rate_bps);
+            SDL_Color rc = live_rate_bps >= 200.0f ? (SDL_Color){0, 200, 110, 255} :
+                           live_rate_bps >= 50.0f  ? (SDL_Color){200, 170, 0, 255} :
+                                                     (SDL_Color){210, 80, 40, 255};
+            draw_text(ren, font, rate_buf, x, STAT_Y + 4, rc);
+
+            int rate_w = 120;
+            if (font && TTF_SizeUTF8(font, rate_buf, &rate_w, NULL) != 0)
+                rate_w = 120;
+            x += rate_w + 12;
+        }
+
         /* FEC statistics */
         if (fec_enabled) {
             char fec_buf[64];
@@ -939,9 +1203,8 @@ static void render_frame(SDL_Renderer *ren, TTF_Font *font,
         /* ── 4-box symbol window indicator ──────────────────────── */
         const int BOX_W = 22, BOX_H = 22, BOX_GAP = 3;
         int bx = CHART_X + 58;
-        const char *box_lbl[SYM_WINDOWS] = {"B", "1", "2", "3"};
 
-        for (int w = 0; w < SYM_WINDOWS; w++) {
+        for (int w = 0; w < sym_windows_cfg; w++) {
             int is_cur = (timing_locked && w == sym_window);
 
             Uint8 r, g, b;
@@ -954,7 +1217,7 @@ static void render_frame(SDL_Renderer *ren, TTF_Font *font,
                 r = active_bnd ? 220 : (is_cur ? 160 : 80);
                 g = active_bnd ?  45 : (is_cur ?  90 : 45);
                 b = active_bnd ?  15 : (is_cur ?  15 : 10);
-            } else if (w == SYM_WINDOWS - 1) {   /* last safe slot         */
+            } else if (w == decode_window_idx) {  /* preferred decode slot  */
                 r = is_cur ?  80 : 30;
                 g = is_cur ? 170 : 90;
                 b = is_cur ?  30 : 15;
@@ -975,7 +1238,16 @@ static void render_frame(SDL_Renderer *ren, TTF_Font *font,
             }
 
             SDL_Color lc = {190, 190, 210, 255};
-            draw_text(ren, font, box_lbl[w],
+            char box_lbl[8];
+            if (w == 0) {
+                memcpy(box_lbl, "B", 2);
+            } else {
+                int n = snprintf(box_lbl, sizeof(box_lbl), "%d", w);
+                if (n < 0 || n >= (int)sizeof(box_lbl)) {
+                    memcpy(box_lbl, "*", 2);
+                }
+            }
+            draw_text(ren, font, box_lbl,
                       bx + (BOX_W - 7) / 2, SYNC_Y + 4, lc);
             bx += BOX_W + BOX_GAP;
         }
@@ -1128,6 +1400,9 @@ int main(int argc, char *argv[])
     int            M            = 4;   /* default: QPSK */
     int            fec_enabled  = 0;
     int            fec_depth    = PSK_DEFAULT_ILVE_DEPTH;
+    int            carrier_hz   = DEFAULT_CARRIER_CYCLES * SAMPLE_RATE / 256;
+    int            buffers_per_symbol = 64;
+    int            num_carriers = DEFAULT_NUM_CARRIERS;
     const char    *output_file  = NULL; /* NULL → no file output        */
     PaDeviceIndex  forced_device = paNoDevice;
     const char    *name_pattern  = NULL;
@@ -1187,6 +1462,54 @@ int main(int argc, char *argv[])
                 return 1;
             }
 
+        } else if (strcmp(argv[a], "-c") == 0) {
+            if (a + 1 >= argc) {
+                fprintf(stderr, "Error: -c requires carrier frequency in Hz.\n");
+                return 1;
+            }
+            if (!parse_carrier_hz(argv[++a], &carrier_hz)) {
+                char *ep;
+                long raw = strtol(argv[a], &ep, 10);
+                fprintf(stderr,
+                        "Error: invalid carrier frequency '%s' Hz (must be integer in 1..%d).\n",
+                        argv[a], MAX_CARRIER_HZ - 1);
+                if (ep != argv[a]) {
+                    int nearest = nearest_compatible_hz((int)raw);
+                    fprintf(stderr,
+                            "       Nearest compatible frequency: %d Hz.\n",
+                            nearest);
+                }
+                fprintf(stderr,
+                        "       Example values: 750, 1125, 1500.\n");
+                return 1;
+            }
+
+        } else if (strcmp(argv[a], "-s") == 0) {
+            if (a + 1 >= argc) {
+                fprintf(stderr, "Error: -s requires buffers-per-symbol value.\n");
+                return 1;
+            }
+            if (!parse_buffers_per_symbol(argv[++a], &buffers_per_symbol)) {
+                fprintf(stderr,
+                        "Error: invalid -s value '%s' (must be integer >= %d and divisible by 16).\n",
+                        argv[a], 32);
+                fprintf(stderr,
+                        "       Example values: 32, 48, 64.\n");
+                return 1;
+            }
+
+        } else if (strcmp(argv[a], "-k") == 0) {
+            if (a + 1 >= argc) {
+                fprintf(stderr, "Error: -k requires a carrier-count value.\n");
+                return 1;
+            }
+            if (!parse_num_carriers(argv[++a], &num_carriers)) {
+                fprintf(stderr,
+                        "Error: invalid -k value '%s' (must be integer in 1..%d).\n",
+                        argv[a], MAX_NUM_CARRIERS);
+                return 1;
+            }
+
         } else if (strcmp(argv[a], "--device") == 0) {
             if (a + 1 >= argc) {
                 fprintf(stderr, "Error: --device requires a device index.\n");
@@ -1209,26 +1532,78 @@ int main(int argc, char *argv[])
 
         } else {
             fprintf(stderr, "Unknown argument: %s\n"
-                    "Usage: %s [-m M] [-e] [-d DEPTH] [-o OUTPUT_FILE]\n"
+                    "Usage: %s [-m M] [-c FREQ_HZ] [-s BUFS] [-k CARRIERS] [-e] [-d DEPTH] [-o OUTPUT_FILE]\n"
                     "          [--device <idx>] [-n <substr>] [--list-devices]\n"
+                    "  -c HZ     carrier frequency in Hz (integer, < %d)\n"
+                    "  -s N      TX buffers/symbol (>= %d, divisible by 16)\n"
+                    "  -k N      number of parallel carriers (1..%d, spacing %d Hz)\n"
                     "  -o FILE   write decoded bytes to FILE when carrier drops\n",
-                    argv[a], argv[0]);
+                    argv[a], argv[0], MAX_CARRIER_HZ, MIN_BUFFERS_PER_SYMBOL,
+                    MAX_NUM_CARRIERS, CARRIER_SPACING_HZ);
             return 1;
         }
     }
 
+    if (((long)carrier_hz * 256) % SAMPLE_RATE != 0) {
+        int nearest = nearest_compatible_hz(carrier_hz);
+        fprintf(stderr,
+                "Error: carrier %d Hz is incompatible with %d Hz sample rate and 256-sample TX buffers.\n",
+                carrier_hz, SAMPLE_RATE);
+        fprintf(stderr,
+                "       Choose a frequency where (Hz * 256) is divisible by %d.\n",
+                SAMPLE_RATE);
+        fprintf(stderr,
+                "       Nearest compatible frequency: %d Hz.\n",
+                nearest);
+        fprintf(stderr,
+                "       Examples: 750 Hz, 1125 Hz, 1500 Hz.\n");
+        return 1;
+    }
+
+    int carrier_cycles = carrier_hz * 256 / SAMPLE_RATE;
+    int spacing_cycles = CARRIER_SPACING_HZ * 256 / SAMPLE_RATE;
+    for (int c = 0; c < num_carriers; c++) {
+        int hz_c = carrier_hz + c * CARRIER_SPACING_HZ;
+        if (hz_c >= MAX_CARRIER_HZ) {
+            fprintf(stderr,
+                    "Error: -k %d with base carrier %d Hz exceeds %d Hz limit at carrier %d (%d Hz).\n",
+                    num_carriers, carrier_hz, MAX_CARRIER_HZ - 1, c + 1, hz_c);
+            return 1;
+        }
+        if (((long)hz_c * 256) % SAMPLE_RATE != 0) {
+            fprintf(stderr,
+                    "Error: derived carrier %d Hz is incompatible with sample timing.\n",
+                    hz_c);
+            return 1;
+        }
+    }
+
+    int sym_windows_cfg = (buffers_per_symbol * 256) / FRAMES_PER_BUFFER;
+    int decode_window_idx = sym_windows_cfg / 2;
+    if (decode_window_idx < 1) decode_window_idx = 1;
+    g_num_carriers = num_carriers;
+    for (int c = 0; c < num_carriers; c++) {
+        int cyc = carrier_cycles + c * spacing_cycles;
+        g_carrier_bins[c] = cyc * CARRIER_BIN_PER_CYCLE;
+        g_carrier_hzs[c]  = (float)cyc * SAMPLE_RATE / 256.0f;
+    }
+    g_carrier_bin = g_carrier_bins[0];
+    g_carrier_hz  = g_carrier_hzs[0];
+
     /* ── precompute carrier phasor table ──────────────────────────── */
-    for (size_t i = 0; i < FRAMES_PER_BUFFER; i++) {
-        exptable[i] = cexpf(-I * 2.0f * (float)M_PI
-                             * (float)CARRIER_BIN / (float)FRAMES_PER_BUFFER
-                             * (float)i);
+    for (int c = 0; c < num_carriers; c++) {
+        for (size_t i = 0; i < FRAMES_PER_BUFFER; i++) {
+            exptable[c][i] = cexpf(-I * 2.0f * (float)M_PI
+                                    * (float)g_carrier_bins[c] / (float)FRAMES_PER_BUFFER
+                                    * (float)i);
+        }
     }
 
     fprintf(stderr,
-            "%d-PSK receiver — carrier bin %d (~%.0f Hz), %d bit%s/symbol\n",
-            M, CARRIER_BIN,
-            (float)CARRIER_BIN * SAMPLE_RATE / FRAMES_PER_BUFFER,
-            ilog2(M), ilog2(M) == 1 ? "" : "s");
+            "%d-PSK receiver — %d carrier%s, primary bin %d (~%.0f Hz), %d bit%s/symbol each, %d win/sym\n",
+            M, num_carriers, num_carriers == 1 ? "" : "s",
+            g_carrier_bin, g_carrier_hz,
+            ilog2(M), ilog2(M) == 1 ? "" : "s", sym_windows_cfg);
 
     /* ── SDL2 + SDL_ttf ──────────────────────────────────────────── */
     if (SDL_Init(SDL_INIT_VIDEO) < 0) {
@@ -1270,7 +1645,7 @@ int main(int argc, char *argv[])
         NULL
     };
     for (int fp = 0; font_paths[fp] && !font; fp++)
-        font = TTF_OpenFont(font_paths[fp], 13);
+        font = TTF_OpenFont(font_paths[fp], 18);
     if (!font)
         fprintf(stderr,
                 "Warning: no font found — text labels will be absent.\n");
@@ -1361,10 +1736,12 @@ int main(int argc, char *argv[])
 
         /* ── main event / render loop ─────────────────────────────── */
         float local_samples[FRAMES_PER_BUFFER];
-        float magnitudes[BAR_WIDTH];
+        float analysis_magnitudes[BAR_WIDTH];
+        float display_magnitudes[BAR_WIDTH];
         float peaks[BAR_WIDTH];
 
-        memset(magnitudes, 0, sizeof(magnitudes));
+        memset(analysis_magnitudes, 0, sizeof(analysis_magnitudes));
+        memset(display_magnitudes, 0, sizeof(display_magnitudes));
         memset(peaks,      0, sizeof(peaks));
 
         /* Channel quality state */
@@ -1423,7 +1800,7 @@ int main(int argc, char *argv[])
         int      fec_corrections = 0;      /* running correction count */
 
         /* IQ history (calibrated carrier phasors) */
-        IQ_Point iq_hist[IQ_HISTORY];
+        IQ_Point iq_hist[MAX_NUM_CARRIERS][IQ_HISTORY];
         int      iq_head  = 0;
         int      iq_count = 0;
         memset(iq_hist, 0, sizeof(iq_hist));
@@ -1438,6 +1815,7 @@ int main(int argc, char *argv[])
         float ref_mag      = 1.0f;    /* calibrated reference magnitude        */
         int   current_sym  = 0;
         int   current_bits = 0;
+        int   current_sym_c[MAX_NUM_CARRIERS] = {0};
 
         /* ── Timing recovery state ──────────────────────────────────
          *
@@ -1484,17 +1862,25 @@ int main(int argc, char *argv[])
         float pll_error_deg = 0.0f;
 
         /* Local copies of shared data */
-        float local_ft_re = 0.0f, local_ft_im = 0.0f;
+        float local_ft_re[MAX_NUM_CARRIERS] = {0};
+        float local_ft_im[MAX_NUM_CARRIERS] = {0};
+        float carrier_mag_c[MAX_NUM_CARRIERS] = {0};
         float carrier_mag = 0.0f;
+        float live_rate_bps = 0.0f;
+        uint32_t rate_start_ticks = 0;
+        size_t   rate_start_bits  = 0;
+        int current_bits_c[MAX_NUM_CARRIERS] = {0};
 
         /* Initial blank frame */
-        render_frame(ren, font, magnitudes, peaks,
-                     0.0f, 0.0f, 0, 0, rx_state, M,
+        render_frame(ren, font, display_magnitudes, peaks,
+                     0.0f, 0.0f, 0, 0, rx_state, M, 0.0f,
+                     sym_windows_cfg, decode_window_idx,
                      sym_window, is_boundary, timing_locked, pll_error_deg,
                      snr_db, interference, intf_bin,
                      fec_enabled, fec_corrections, fec_depth);
-        render_iq_panel(ren, font, iq_hist, iq_head, iq_count,
-                        M, current_sym, rx_state, timing_locked, sym_window);
+        render_iq_panels(ren, font, iq_hist, iq_head, iq_count,
+                         M, current_sym_c, rx_state,
+                         timing_locked, sym_window, num_carriers);
         render_decoded_output(ren, font,
                                preview_buf, preview_chars,
                                preview_bytes, preview_corr,
@@ -1519,9 +1905,12 @@ int main(int argc, char *argv[])
             if (pthread_mutex_trylock(&s_mutex) == 0) {
                 if (s_new_data) {
                     memcpy(local_samples, s_samples, sizeof(local_samples));
-                    local_ft_re = s_ft_re;
-                    local_ft_im = s_ft_im;
-                    carrier_mag = s_mag;
+                    for (int c = 0; c < num_carriers; c++) {
+                        local_ft_re[c] = s_ft_re[c];
+                        local_ft_im[c] = s_ft_im[c];
+                        carrier_mag_c[c] = s_mag[c];
+                    }
+                    carrier_mag = carrier_mag_c[0];
                     s_new_data  = 0;
                     got         = 1;
                 }
@@ -1533,19 +1922,27 @@ int main(int argc, char *argv[])
                 continue;
             }
 
-            /* ── compute full FFT (for display) ─────────────────── */
-            compute_dft(local_samples, FRAMES_PER_BUFFER, magnitudes);
+            /* ── compute FFT data for analysis + display ─────────── */
+            compute_dft(local_samples, FRAMES_PER_BUFFER, analysis_magnitudes);
+            compute_display_spectrum(local_samples, FRAMES_PER_BUFFER,
+                                     display_magnitudes);
 
 
 
             /* ── channel quality estimates ──────────────────────── */
-            snr_db     = psk_snr_estimate_db(magnitudes, BAR_WIDTH,
-                                              CARRIER_BIN);
-            interference = psk_detect_interference(magnitudes, BAR_WIDTH,
-                                                    CARRIER_BIN, &intf_bin);
+            if (g_carrier_bin >= 0 && g_carrier_bin < BAR_WIDTH) {
+                snr_db = psk_snr_estimate_db(analysis_magnitudes, BAR_WIDTH,
+                                             g_carrier_bin);
+                interference = psk_detect_interference(analysis_magnitudes, BAR_WIDTH,
+                                                       g_carrier_bin, &intf_bin);
+            } else {
+                snr_db = -60.0f;
+                interference = 0;
+                intf_bin = 0;
+            }
 
             /* ── derived carrier quantities ─────────────────────── */
-            float received_phase    = atan2f(local_ft_im, local_ft_re);
+            float received_phase    = atan2f(local_ft_im[0], local_ft_re[0]);
             float carrier_phase_deg = received_phase * 180.0f / (float)M_PI;
 
             /* ── Symbol-aligned window extraction ───────────────────
@@ -1557,10 +1954,10 @@ int main(int argc, char *argv[])
              * This solves the fundamental issue: PortAudio windows have
              * arbitrary timing with no relation to symbol boundaries.
              */
-            if (use_aligned_windows && timing_locked && sym_window == 2) {
+            if (use_aligned_windows && timing_locked && sym_window == decode_window_idx) {
                 /* Calculate target sample position - always extract window 2
                  * (the 3rd window after boundary, which is in the middle of the symbol) */
-                size_t target_offset = 2 * FRAMES_PER_BUFFER;
+                size_t target_offset = (size_t)decode_window_idx * FRAMES_PER_BUFFER;
                 size_t target_sample = last_boundary_sample + target_offset;
 
                 pthread_mutex_lock(&slide_mutex);
@@ -1577,16 +1974,17 @@ int main(int argc, char *argv[])
                     }
 
                     /* Recompute DFT on aligned window */
-                    float complex ft_aligned = 0.0f;
-                    for (size_t i = 0; i < FRAMES_PER_BUFFER; i++) {
-                        ft_aligned += aligned_window[i] * exptable[i];
+                    for (int c = 0; c < num_carriers; c++) {
+                        float complex ft_aligned = 0.0f;
+                        for (size_t i = 0; i < FRAMES_PER_BUFFER; i++) {
+                            ft_aligned += aligned_window[i] * exptable[c][i];
+                        }
+                        local_ft_re[c] = crealf(ft_aligned);
+                        local_ft_im[c] = cimagf(ft_aligned);
+                        carrier_mag_c[c] = cabsf(ft_aligned);
                     }
-
-                    /* Update carrier values with aligned measurements */
-                    local_ft_re = crealf(ft_aligned);
-                    local_ft_im = cimagf(ft_aligned);
-                    carrier_mag = cabsf(ft_aligned);
-                    received_phase = atan2f(local_ft_im, local_ft_re);
+                    carrier_mag = carrier_mag_c[0];
+                    received_phase = atan2f(local_ft_im[0], local_ft_re[0]);
                     carrier_phase_deg = received_phase * 180.0f / (float)M_PI;
                 }
 
@@ -1619,7 +2017,7 @@ int main(int argc, char *argv[])
              * slots only.
              * ═══════════════════════════════════════════════════════ */
             {
-                float complex ft_curr = local_ft_re + I * local_ft_im;
+                float complex ft_curr = local_ft_re[0] + I * local_ft_im[0];
                 float complex ft_prev = ft_prev_re  + I * ft_prev_im;
 
                 /* Run the comparator whenever the current window has a
@@ -1654,7 +2052,7 @@ int main(int argc, char *argv[])
                     } else {
                         is_boundary = 0;
                         if (timing_locked)
-                            sym_window = (sym_window + 1) % SYM_WINDOWS;
+                            sym_window = (sym_window + 1) % sym_windows_cfg;
                     }
                 } else {
                     is_boundary = 0;
@@ -1662,8 +2060,8 @@ int main(int argc, char *argv[])
                 }
 
                 /* Save current complex value for next frame */
-                ft_prev_re = local_ft_re;
-                ft_prev_im = local_ft_im;
+                ft_prev_re = local_ft_re[0];
+                ft_prev_im = local_ft_im[0];
             }
 
             /* ── Reset accumulator on first timing lock ───────────────
@@ -1815,6 +2213,19 @@ int main(int argc, char *argv[])
                         /* Safe window: accept this decision */
                         current_sym  = candidate_sym;
                         current_bits = candidate_bits;
+                        current_sym_c[0] = candidate_sym;
+                        current_bits_c[0] = candidate_bits;
+
+                        for (int c = 1; c < num_carriers; c++) {
+                            float corrected_c = atan2f(local_ft_im[c], local_ft_re[c]) - phase_offset;
+                            corrected_c = fmodf(corrected_c + 4.0f * (float)M_PI,
+                                                2.0f * (float)M_PI);
+                            int sym_c = (int)roundf(
+                                (float)M * corrected_c / (2.0f * (float)M_PI));
+                            int candidate_sym_c = ((sym_c % M) + M) % M;
+                            current_sym_c[c] = candidate_sym_c;
+                            current_bits_c[c] = gray_decode(candidate_sym_c);
+                        }
 
                         /* ── PLL update ────────────────────────────
                          * Phase error = distance from the ideal angle
@@ -1837,18 +2248,19 @@ int main(int argc, char *argv[])
                  * inter-symbol smear is visible in the constellation;
                  * boundary points are flagged for different colouring. */
                 {
-                    float store_phase;
-                    if (rx_state == 2)
-                        store_phase = received_phase - phase_offset;
-                    else
-                        store_phase = received_phase;
+                    for (int c = 0; c < num_carriers; c++) {
+                        float phase_c = atan2f(local_ft_im[c], local_ft_re[c]);
+                        float store_phase = (rx_state == 2)
+                                          ? (phase_c - phase_offset)
+                                          : phase_c;
 
-                    float amp = (rx_state == 2 && ref_mag > 0.0f)
-                              ? carrier_mag / ref_mag
-                              : 1.0f;
-                    IQ_Point p = {amp * cosf(store_phase), amp * sinf(store_phase),
-                                  is_boundary};
-                    iq_hist[iq_head] = p;
+                        float amp = (rx_state == 2 && ref_mag > 0.0f)
+                                  ? carrier_mag_c[c] / ref_mag
+                                  : 1.0f;
+                        IQ_Point p = {amp * cosf(store_phase), amp * sinf(store_phase),
+                                      is_boundary};
+                        iq_hist[c][iq_head] = p;
+                    }
                     iq_head = (iq_head + 1) % IQ_HISTORY;
                     if (iq_count < IQ_HISTORY) iq_count++;
                 }
@@ -1884,9 +2296,9 @@ int main(int argc, char *argv[])
              *                           drops, which caused the repeated
              *                           "Decoded 1 byte" spam)
              *   !timing_locked ||      — before timing locks, take all
-             *   sym_window == 2        — after timing locks, take only
-             *                           the middle window (window 2 of
-             *                           the 4-window cycle).  Without
+             *   sym_window == decode   — after timing locks, take only
+             *                           the configured decode window.
+             *                           Without
              *                           this gate every symbol was
              *                           sampled 3 times, tripling the
              *                           bit count and corrupting the
@@ -1894,13 +2306,14 @@ int main(int argc, char *argv[])
              */
             if (rx_state == 2 && !is_boundary
                 && (snr_db >= CARRIER_SNR_MIN_DB || carrier_mag > SIG_THRESHOLD)
-                && (!timing_locked || sym_window == 2)
+                && (!timing_locked || sym_window == decode_window_idx)
                 && skip_after_lock == 0) {
                 int    bps      = ilog2(M);
                 size_t bits_now = fec_sym_bits;   /* exact bit position */
+                int    total_bps = bps * num_carriers;
 
                 /* Grow buffer on demand */
-                if (bits_now + (size_t)bps > fec_sym_cap * 8) {
+                if (bits_now + (size_t)total_bps > fec_sym_cap * 8) {
                     size_t new_cap = fec_sym_cap + 256;
                     uint8_t *nb    = realloc(fec_sym_buf, new_cap);
                     if (nb) {
@@ -1910,15 +2323,17 @@ int main(int argc, char *argv[])
                     }
                 }
                 if (fec_sym_buf) {
-                    /* Append bps bits of current_bits MSB-first.
+                    /* Append bps bits per carrier MSB-first.
                      * IMPORTANT: bits_now starts from fec_sym_bits, NOT
                      * fec_sym_len*8.  fec_sym_len is ceil(bits/8) so
                      * restarting from it would skip bits 2-7 of each
                      * partial byte, producing garbled output. */
-                    for (int b = bps - 1; b >= 0; b--) {
-                        psk_setbit(fec_sym_buf, bits_now,
-                                   (current_bits >> b) & 1);
-                        bits_now++;
+                    for (int c = 0; c < num_carriers; c++) {
+                        for (int b = bps - 1; b >= 0; b--) {
+                            psk_setbit(fec_sym_buf, bits_now,
+                                       (current_bits_c[c] >> b) & 1);
+                            bits_now++;
+                        }
                     }
                     fec_sym_bits = bits_now;
                     fec_sym_len  = (bits_now + 7) / 8;
@@ -2012,8 +2427,23 @@ int main(int argc, char *argv[])
                 preview_corr    = 0;
                 preview_src_len = 0;
                 memset(preview_buf, 0, sizeof(preview_buf));
+
+                rate_start_ticks = SDL_GetTicks();
+                rate_start_bits  = fec_sym_bits;
+                live_rate_bps    = 0.0f;
             }
             prev_rx_state = rx_state;
+
+            if (rate_start_ticks != 0) {
+                uint32_t now_ms = SDL_GetTicks();
+                float elapsed_s = (float)(now_ms - rate_start_ticks) / 1000.0f;
+                if (elapsed_s > 0.05f && fec_sym_bits >= rate_start_bits)
+                    live_rate_bps =
+                        (float)(fec_sym_bits - rate_start_bits) / elapsed_s;
+            }
+
+            if (rx_state == 0 && fec_sym_len == 0)
+                rate_start_ticks = 0;
 
             if (fec_sym_len != preview_src_len && fec_sym_len > 0) {
                 preview_src_len = fec_sym_len;
@@ -2072,17 +2502,18 @@ int main(int argc, char *argv[])
             }
 
             /* ── render both panels, then present ───────────────── */
-            render_frame(ren, font, magnitudes, peaks,
+            render_frame(ren, font, display_magnitudes, peaks,
                          carrier_mag, carrier_phase_deg,
-                         current_sym, current_bits, rx_state, M,
+                         current_sym, current_bits, rx_state, M, live_rate_bps,
+                         sym_windows_cfg, decode_window_idx,
                          sym_window, is_boundary, timing_locked,
                          pll_error_deg,
                          snr_db, interference, intf_bin,
                          fec_enabled, fec_corrections, fec_depth);
 
-            render_iq_panel(ren, font, iq_hist, iq_head, iq_count,
-                            M, current_sym, rx_state,
-                            timing_locked, sym_window);
+            render_iq_panels(ren, font, iq_hist, iq_head, iq_count,
+                             M, current_sym_c, rx_state,
+                             timing_locked, sym_window, num_carriers);
 
             render_decoded_output(ren, font,
                                    preview_buf, preview_chars,
