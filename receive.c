@@ -61,8 +61,8 @@
 #define CARRIER_BIN_PER_CYCLE   (FRAMES_PER_BUFFER / 256)
 #define MIN_BUFFERS_PER_SYMBOL   32
 #define DEFAULT_NUM_CARRIERS      1
-#define MAX_NUM_CARRIERS          8
-#define CARRIER_SPACING_HZ      750
+#define MAX_NUM_CARRIERS         32
+#define CARRIER_SPACING_HZ      375
 
 static int   g_carrier_bin = DEFAULT_CARRIER_CYCLES * CARRIER_BIN_PER_CYCLE;
 static float g_carrier_hz  = 750.0f;
@@ -80,13 +80,13 @@ static int   g_num_carriers = 1;
  * receiver enters calibration.  This SNR gate is scale-independent and
  * is the primary carrier-present criterion for OTA use.
  */
-#define SIG_THRESHOLD            20.0f
+#define SIG_THRESHOLD            5.0f
 
 /* Minimum carrier SNR (dB) to consider the carrier present.
  * Uses the snr_db value already computed from the FFT magnitude array.
  * 6 dB ≈ carrier power 4× the average noise-bin power — clearly visible
  * in the FFT display while still rejecting broadband noise. */
-#define CARRIER_SNR_MIN_DB       6.0f
+#define CARRIER_SNR_MIN_DB       1.0f
 
 /* Number of receiver windows used for preamble calibration.
  * Each window is FRAMES_PER_BUFFER samples.  With BUFFERS_PER_SYMBOL=64
@@ -98,24 +98,25 @@ static int   g_num_carriers = 1;
 /* ═══════════════════════════════════════════════════════════════════
  * Window / chart geometry
  * ═══════════════════════════════════════════════════════════════════ */
-#define WIN_W     1700
-#define WIN_H     1020   /* includes decoded-output panel at bottom           */
+#define WIN_W     2100
+#define WIN_H     1320   /* includes decoded-output panel at bottom           */
 
 #define CHART_X     50
-#define CHART_Y     64
-#define CHART_W    900   /* = BAR_WIDTH × BAR_PX_W = 100 × 9 */
-#define CHART_H    560
+#define CHART_Y    112
+#define CHART_W   1100   /* = BAR_WIDTH × BAR_PX_W = 100 × 11 */
+#define CHART_H    700
 #define BAR_WIDTH  100
-#define BAR_PX_W     9
+#define BAR_PX_W    11
 
 #define FFT_DISPLAY_MIN_HZ 20.0f
 #define FFT_DISPLAY_MAX_HZ 20000.0f
 
-#define AXIS_Y   (CHART_Y + CHART_H +  8)   /* Hz tick labels               */
-#define INFO_Y   (CHART_Y + CHART_H + 34)   /* carrier / decode readout     */
-#define SYNC_Y   (CHART_Y + CHART_H + 60)   /* timing + PLL row             */
-#define STAT_Y   (CHART_Y + CHART_H + 86)   /* SNR / FEC / interference row */
-#define HINT_Y   (CHART_Y + CHART_H + 118)  /* keyboard hint                */
+#define AXIS_Y   (CHART_Y + CHART_H + 12)   /* Hz tick labels               */
+#define INFO_Y   (AXIS_Y + 42)              /* carrier magnitude/phase row  */
+#define INFO2_Y  (INFO_Y + 34)              /* symbol/state row             */
+#define SYNC_Y   (INFO2_Y + 40)             /* timing + PLL row             */
+#define STAT_Y   (SYNC_Y + 36)              /* SNR / FEC / interference row */
+#define HINT_Y   (STAT_Y + 36)              /* keyboard hint                */
 
 /* ── Decoded output panel (full-width strip at the bottom) ─────── */
 #define OUTPUT_X   CHART_X                  /* left-aligned with FFT chart   */
@@ -139,9 +140,9 @@ static int   g_num_carriers = 1;
 #define PLL_ALPHA    0.025f
 
 /* ── IQ constellation panel (right of FFT chart) ─────────────────── */
-#define IQ_X      990   /* = CHART_X + CHART_W + 40                  */
-#define IQ_Y       64
-#define IQ_SIZE   620   /* square panel                               */
+#define IQ_X      1200  /* = CHART_X + CHART_W + 50                  */
+#define IQ_Y      112
+#define IQ_SIZE   820   /* square panel                               */
 #define IQ_HISTORY 200  /* frames of phase history (~16 s at ~12 Hz) */
 
 /* ═══════════════════════════════════════════════════════════════════
@@ -247,6 +248,41 @@ static int parse_num_carriers(const char *s, int *out_n)
     if (v < 1 || v > MAX_NUM_CARRIERS) return 0;
     *out_n = (int)v;
     return 1;
+}
+
+static int carrier_offset_index(int idx)
+{
+    if (idx <= 0) return 0;
+    int step = (idx + 1) / 2;
+    return (idx & 1) ? step : -step;
+}
+
+static void print_base_range_hint(int num_carriers)
+{
+    int min_off = 0;
+    int max_off = 0;
+    for (int c = 0; c < num_carriers; c++) {
+        int off = carrier_offset_index(c);
+        if (off < min_off) min_off = off;
+        if (off > max_off) max_off = off;
+    }
+
+    int base_min = 1 - min_off * CARRIER_SPACING_HZ;
+    int base_max = (MAX_CARRIER_HZ - 1) - max_off * CARRIER_SPACING_HZ;
+
+    const int step = SAMPLE_RATE / gcd_int(SAMPLE_RATE, 256);
+    int min_compat = ((base_min + step - 1) / step) * step;
+    int max_compat = (base_max / step) * step;
+
+    if (min_compat <= max_compat) {
+        fprintf(stderr,
+                "       For -k %d, valid base carrier range is %d..%d Hz (compatible step %d Hz).\n",
+                num_carriers, min_compat, max_compat, step);
+    } else {
+        fprintf(stderr,
+                "       No compatible base frequency exists for -k %d with spacing %d Hz under %d Hz limit.\n",
+                num_carriers, CARRIER_SPACING_HZ, MAX_CARRIER_HZ - 1);
+    }
 }
 
 /* Gray decode: convert Gray code word back to natural binary */
@@ -381,18 +417,35 @@ static void draw_text(SDL_Renderer *ren, TTF_Font *font,
 
 static SDL_Color carrier_color(int idx)
 {
-    static const SDL_Color palette[MAX_NUM_CARRIERS] = {
-        {255, 210,   0, 255},
-        {255, 120,  40, 255},
-        {200, 110, 255, 255},
-        { 70, 200, 255, 255},
-        {120, 235, 100, 255},
-        {255, 170, 210, 255},
-        {160, 255, 210, 255},
-        {255, 235, 120, 255}
-    };
     if (idx < 0) idx = 0;
-    return palette[idx % MAX_NUM_CARRIERS];
+    float h = fmodf(0.61803398875f * (float)idx, 1.0f);  /* golden-ratio hue step */
+    float s = 0.65f;
+    float v = 1.0f;
+
+    float hh = h * 6.0f;
+    int   i  = (int)floorf(hh);
+    float f  = hh - (float)i;
+    float p  = v * (1.0f - s);
+    float q  = v * (1.0f - s * f);
+    float t  = v * (1.0f - s * (1.0f - f));
+
+    float r, g, b;
+    switch (i % 6) {
+    case 0: r = v; g = t; b = p; break;
+    case 1: r = q; g = v; b = p; break;
+    case 2: r = p; g = v; b = t; break;
+    case 3: r = p; g = q; b = v; break;
+    case 4: r = t; g = p; b = v; break;
+    default:r = v; g = p; b = q; break;
+    }
+
+    SDL_Color c = {
+        (Uint8)(r * 255.0f),
+        (Uint8)(g * 255.0f),
+        (Uint8)(b * 255.0f),
+        255
+    };
+    return c;
 }
 
 /* ───────────────────────────────────────────────────────────────────
@@ -701,15 +754,15 @@ static void render_decoded_output(SDL_Renderer *ren, TTF_Font *font,
     const int H          = OUTPUT_H;
     const int PAD_X      = 8;
     const int PAD_Y      = 5;
-    const int LINE_H     = 15;          /* pixels per text row              */
-    const int TITLE_H    = 22;          /* pixels for the title row         */
+    const int LINE_H     = 22;          /* pixels per text row              */
+    const int TITLE_H    = 30;          /* pixels for the title row         */
     const int SEP_Y      = Y + PAD_Y + TITLE_H;
     const int CONTENT_Y  = SEP_Y + 5;
     const int CONTENT_H  = H - (CONTENT_Y - Y) - 4;
     const int MAX_LINES  = CONTENT_H / LINE_H;
     /* Maximum bytes per display line.  At ~7 px/char and OUTPUT_W ≈ 1030 px
      * the comfortable column count is around 128 characters.              */
-    const int COLS       = 128;
+    const int COLS       = 108;
 
     /* ── panel background ──────────────────────────────────────────── */
     SDL_SetRenderDrawColor(ren, 6, 6, 14, 255);
@@ -889,24 +942,36 @@ static void render_frame(SDL_Renderer *ren, TTF_Font *font,
                  M, ilog2(M), ilog2(M) == 1 ? "" : "s",
                  g_num_carriers, g_num_carriers == 1 ? "" : "s");
         SDL_Color c = {175, 175, 210, 255};
-        draw_text(ren, font, title, CHART_X, 12, c);
+        draw_text(ren, font, title, CHART_X, 18, c);
 
         /* Per-carrier color legend */
         int lx = CHART_X;
-        const int ly = 30;
+        int ly = 48;
+        const int line_h = 24;
+        const int max_x = CHART_X + CHART_W - 20;
         for (int k = 0; k < g_num_carriers; k++) {
+            char lbuf[40];
+            snprintf(lbuf, sizeof(lbuf), "C%d %.0fHz", k + 1, g_carrier_hzs[k]);
+
+            int label_w = (int)strlen(lbuf) * 9;
+            if (font && TTF_SizeUTF8(font, lbuf, &label_w, NULL) != 0)
+                label_w = (int)strlen(lbuf) * 9;
+            int entry_w = 14 + label_w + 16;
+
+            if (lx + entry_w > max_x) {
+                lx = CHART_X;
+                ly += line_h;
+            }
+
             SDL_Color cc = carrier_color(k);
             SDL_SetRenderDrawColor(ren, cc.r, cc.g, cc.b, 255);
             SDL_Rect sw = {lx, ly + 3, 10, 10};
             SDL_RenderFillRect(ren, &sw);
 
-            char lbuf[40];
-            snprintf(lbuf, sizeof(lbuf), "C%d %.0fHz", k + 1, g_carrier_hzs[k]);
             SDL_Color lc = {155, 155, 190, 255};
             draw_text(ren, font, lbuf, lx + 14, ly, lc);
 
-            lx += 92;
-            if (lx > CHART_X + CHART_W - 90) break;
+            lx += entry_w;
         }
     }
 
@@ -1049,14 +1114,18 @@ static void render_frame(SDL_Renderer *ren, TTF_Font *font,
                 snprintf(buf, sizeof(buf),
                          "Symbol: %d   Bits: %s", current_sym, bits_str);
             }
-            draw_text(ren, font, buf, CHART_X + 350, INFO_Y, sc);
+            draw_text(ren, font, buf, CHART_X, INFO2_Y, sc);
         }
 
         /* Keyboard hint */
         {
             SDL_Color c = {48, 48, 75, 255};
+            const char *hint = "Q / Esc  to quit";
+            int hint_w = 120;
+            if (font && TTF_SizeUTF8(font, hint, &hint_w, NULL) != 0)
+                hint_w = 120;
             draw_text(ren, font, "Q / Esc  to quit",
-                      CHART_X + CHART_W - 118, HINT_Y, c);
+                      CHART_X + CHART_W - hint_w, HINT_Y, c);
         }
     }
 
@@ -1563,11 +1632,13 @@ int main(int argc, char *argv[])
     int carrier_cycles = carrier_hz * 256 / SAMPLE_RATE;
     int spacing_cycles = CARRIER_SPACING_HZ * 256 / SAMPLE_RATE;
     for (int c = 0; c < num_carriers; c++) {
-        int hz_c = carrier_hz + c * CARRIER_SPACING_HZ;
-        if (hz_c >= MAX_CARRIER_HZ) {
+        int off = carrier_offset_index(c);
+        int hz_c = carrier_hz + off * CARRIER_SPACING_HZ;
+        if (hz_c <= 0 || hz_c >= MAX_CARRIER_HZ) {
             fprintf(stderr,
-                    "Error: -k %d with base carrier %d Hz exceeds %d Hz limit at carrier %d (%d Hz).\n",
+                    "Error: -k %d with base carrier %d Hz yields out-of-range carrier %d (%d Hz).\n",
                     num_carriers, carrier_hz, MAX_CARRIER_HZ - 1, c + 1, hz_c);
+            print_base_range_hint(num_carriers);
             return 1;
         }
         if (((long)hz_c * 256) % SAMPLE_RATE != 0) {
@@ -1583,7 +1654,8 @@ int main(int argc, char *argv[])
     if (decode_window_idx < 1) decode_window_idx = 1;
     g_num_carriers = num_carriers;
     for (int c = 0; c < num_carriers; c++) {
-        int cyc = carrier_cycles + c * spacing_cycles;
+        int off = carrier_offset_index(c);
+        int cyc = carrier_cycles + off * spacing_cycles;
         g_carrier_bins[c] = cyc * CARRIER_BIN_PER_CYCLE;
         g_carrier_hzs[c]  = (float)cyc * SAMPLE_RATE / 256.0f;
     }
@@ -1645,7 +1717,7 @@ int main(int argc, char *argv[])
         NULL
     };
     for (int fp = 0; font_paths[fp] && !font; fp++)
-        font = TTF_OpenFont(font_paths[fp], 18);
+        font = TTF_OpenFont(font_paths[fp], 21);
     if (!font)
         fprintf(stderr,
                 "Warning: no font found — text labels will be absent.\n");

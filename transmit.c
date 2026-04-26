@@ -59,8 +59,8 @@
 #define MIN_BUFFERS_PER_SYMBOL     32
 #define DEFAULT_CARRIER_CYCLES 4
 #define DEFAULT_NUM_CARRIERS   1
-#define MAX_NUM_CARRIERS       8
-#define CARRIER_SPACING_HZ     750
+#define MAX_NUM_CARRIERS      32
+#define CARRIER_SPACING_HZ     375
 #define MAX_CARRIER_HZ       20000
 #define PREAMBLE_SYMBOLS     20       /* phase-0° symbols sent before data       */
 
@@ -152,6 +152,41 @@ static int parse_num_carriers(const char *s, int *out_n)
     if (v < 1 || v > MAX_NUM_CARRIERS) return 0;
     *out_n = (int)v;
     return 1;
+}
+
+static int carrier_offset_index(int idx)
+{
+    if (idx <= 0) return 0;
+    int step = (idx + 1) / 2;
+    return (idx & 1) ? step : -step;
+}
+
+static void print_base_range_hint(int num_carriers)
+{
+    int min_off = 0;
+    int max_off = 0;
+    for (int c = 0; c < num_carriers; c++) {
+        int off = carrier_offset_index(c);
+        if (off < min_off) min_off = off;
+        if (off > max_off) max_off = off;
+    }
+
+    int base_min = 1 - min_off * CARRIER_SPACING_HZ;
+    int base_max = (MAX_CARRIER_HZ - 1) - max_off * CARRIER_SPACING_HZ;
+
+    const int step = SAMPLE_RATE / gcd_int(SAMPLE_RATE, FRAMES_PER_BUFFER);
+    int min_compat = ((base_min + step - 1) / step) * step;
+    int max_compat = (base_max / step) * step;
+
+    if (min_compat <= max_compat) {
+        fprintf(stderr,
+                "       For -k %d, valid base carrier range is %d..%d Hz (compatible step %d Hz).\n",
+                num_carriers, min_compat, max_compat, step);
+    } else {
+        fprintf(stderr,
+                "       No compatible base frequency exists for -k %d with spacing %d Hz under %d Hz limit.\n",
+                num_carriers, CARRIER_SPACING_HZ, MAX_CARRIER_HZ - 1);
+    }
 }
 
 /* Binary-reflected Gray encoding: maps a natural binary index n to the
@@ -395,11 +430,13 @@ int main(int argc, char *argv[])
     int carrier_cycles = carrier_hz * FRAMES_PER_BUFFER / SAMPLE_RATE;
     int spacing_cycles = CARRIER_SPACING_HZ * FRAMES_PER_BUFFER / SAMPLE_RATE;
     for (int c = 0; c < num_carriers; c++) {
-        int hz_c = carrier_hz + c * CARRIER_SPACING_HZ;
-        if (hz_c >= MAX_CARRIER_HZ) {
+        int off = carrier_offset_index(c);
+        int hz_c = carrier_hz + off * CARRIER_SPACING_HZ;
+        if (hz_c <= 0 || hz_c >= MAX_CARRIER_HZ) {
             fprintf(stderr,
-                    "Error: -k %d with base carrier %d Hz exceeds %d Hz limit at carrier %d (%d Hz).\n",
+                    "Error: -k %d with base carrier %d Hz yields out-of-range carrier %d (%d Hz).\n",
                     num_carriers, carrier_hz, MAX_CARRIER_HZ - 1, c + 1, hz_c);
+            print_base_range_hint(num_carriers);
             return 1;
         }
         if (((long)hz_c * FRAMES_PER_BUFFER) % SAMPLE_RATE != 0) {
@@ -550,7 +587,8 @@ int main(int argc, char *argv[])
     cb.num_carriers = num_carriers;
     cb.M = M;
     for (int c = 0; c < num_carriers; c++) {
-        int cyc = carrier_cycles + c * spacing_cycles;
+        int off = carrier_offset_index(c);
+        int cyc = carrier_cycles + off * spacing_cycles;
         cb.two_pi_fc_over_n[c] = 2.0f * (float)M_PI * (float)cyc / (float)FRAMES_PER_BUFFER;
     }
 

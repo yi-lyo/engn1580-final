@@ -28,7 +28,7 @@ echo "[Test 1] Quick start (baseline)..."
 OUTPUT_FILE="$TEMP_DIR/quick_output.txt"
 
 # Launch receiver in background with file output
-./receive --device 12 -m 64 -c 12750 -s 64 -k 8 -o "$OUTPUT_FILE" &
+./receive --device 12 -m 256 -c 10125 -s 48 -k 32 -o "$OUTPUT_FILE" &
 RECEIVER_PID=$!
 
 # Small delay to ensure receiver is ready
@@ -36,7 +36,7 @@ sleep 2
 
 # Start transmission immediately
 echo "  Starting transmission (quick)..."
-echo "$TEST_MESSAGE" | ./transmit -m 64 -c 12750 -s 64 -k 8 > /dev/null 2>&1
+./transmit -m 256 -c 10125 -s 48 -k 32 -i "./input.txt"
 
 # Wait for transmission to complete
 sleep 8
