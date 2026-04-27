@@ -17,8 +17,8 @@ LDFLAGS ?=
 # test: pure signal-processing, no PortAudio or SDL2
 LDLIBS_TEST ?= -lm
 
-# transmit: plain PortAudio + math
-LDLIBS_TRANSMIT ?= -lportaudio -lm
+# transmit: PortAudio + math + optional SDL2/SDL2_ttf UI (-u)
+LDLIBS_TRANSMIT ?= -lportaudio -lm $(SDL2_LIBS)
 
 # receive: PortAudio + math + SDL2 + SDL2_ttf + pthreads
 # pkg-config supplies the exact include paths and link flags for SDL2/TTF.
@@ -33,7 +33,7 @@ TARGETS := transmit receive test
 all: $(TARGETS)
 
 transmit: transmit.c
-	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $< $(LDLIBS_TRANSMIT)
+	$(CC) $(CFLAGS) $(SDL2_CFLAGS) $(LDFLAGS) -o $@ $< $(LDLIBS_TRANSMIT)
 
 receive: receive.c
 	$(CC) $(CFLAGS) $(SDL2_CFLAGS) $(LDFLAGS) -o $@ $< $(LDLIBS_RECEIVE)

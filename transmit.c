@@ -43,6 +43,8 @@
 
 #include <math.h>
 #include <portaudio.h>
+#include <SDL2/SDL.h>
+#include <SDL2/SDL_ttf.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -63,6 +65,12 @@
 #define CARRIER_SPACING_HZ     375
 #define MAX_CARRIER_HZ       20000
 #define PREAMBLE_SYMBOLS     20       /* phase-0° symbols sent before data       */
+
+#define UI_WIN_W 1100
+#define UI_WIN_H 680
+#define UI_FFT_BARS 96
+#define UI_FREQ_MIN_HZ 20.0f
+#define UI_FREQ_MAX_HZ 20000.0f
 
 /* Carrier: exactly 4 cycles per 256-sample buffer → 750 Hz.
  * Because the carrier completes an integer number of cycles per buffer,
@@ -243,6 +251,335 @@ static uint8_t *bytes_to_symbols_mc(const uint8_t *data, size_t data_len,
     return syms;
 }
 
+typedef struct {
+    volatile int   tone_enabled;
+    volatile float tone_freq_hz;
+    volatile float tone_intensity;
+    float          tone_phase;
+    volatile int   noise_enabled;
+    volatile float noise_intensity;
+    uint32_t       noise_rng_state;
+    int            noise_has_spare;
+    float          noise_spare;
+    volatile uint32_t latest_seq;
+    volatile int   buffer_ready;
+    float          latest_buffer[FRAMES_PER_BUFFER];
+} tx_ui_state_t;
+
+static void draw_text(SDL_Renderer *ren, TTF_Font *font,
+                      const char *text, int x, int y, SDL_Color col)
+{
+    if (!font || !text || !text[0]) return;
+    SDL_Surface *surf = TTF_RenderUTF8_Blended(font, text, col);
+    if (!surf) return;
+    SDL_Texture *tex = SDL_CreateTextureFromSurface(ren, surf);
+    SDL_FreeSurface(surf);
+    if (!tex) return;
+    int w = 0, h = 0;
+    SDL_QueryTexture(tex, NULL, NULL, &w, &h);
+    SDL_Rect dst = {x, y, w, h};
+    SDL_RenderCopy(ren, tex, NULL, &dst);
+    SDL_DestroyTexture(tex);
+}
+
+static int text_width(TTF_Font *font, const char *text)
+{
+    if (!font || !text || !text[0])
+        return (int)(text ? strlen(text) * 9 : 0);
+    int w = 0;
+    int h = 0;
+    if (TTF_SizeUTF8(font, text, &w, &h) < 0)
+        return (int)strlen(text) * 9;
+    return w;
+}
+
+static int point_in_rect(int x, int y, SDL_Rect r)
+{
+    return x >= r.x && x < (r.x + r.w) && y >= r.y && y < (r.y + r.h);
+}
+
+static float clampf(float x, float lo, float hi)
+{
+    if (x < lo) return lo;
+    if (x > hi) return hi;
+    return x;
+}
+
+static float noise_sigma_from_intensity(float intensity)
+{
+    float x = clampf(intensity, 0.0f, 1.0f);
+    return 0.35f * x * x;
+}
+
+static uint32_t lcg_next(uint32_t *state)
+{
+    *state = (*state * 1664525u) + 1013904223u;
+    return *state;
+}
+
+static float gaussian_randn(tx_ui_state_t *ui)
+{
+    if (ui->noise_has_spare) {
+        ui->noise_has_spare = 0;
+        return ui->noise_spare;
+    }
+
+    float u1 = ((float)((lcg_next(&ui->noise_rng_state) >> 8) & 0x00FFFFFFu) + 1.0f)
+             / 16777217.0f;
+    float u2 = ((float)((lcg_next(&ui->noise_rng_state) >> 8) & 0x00FFFFFFu) + 1.0f)
+             / 16777217.0f;
+
+    float mag = sqrtf(-2.0f * logf(u1));
+    float ang = TWO_PI * u2;
+    ui->noise_spare = mag * sinf(ang);
+    ui->noise_has_spare = 1;
+    return mag * cosf(ang);
+}
+
+static float slider_value_from_x(int mx, SDL_Rect track, float min_v, float max_v)
+{
+    float t = (float)(mx - track.x) / (float)SDL_max(track.w, 1);
+    t = clampf(t, 0.0f, 1.0f);
+    return min_v + t * (max_v - min_v);
+}
+
+static int slider_knob_x(SDL_Rect track, float value, float min_v, float max_v)
+{
+    float span = max_v - min_v;
+    float t = (span > 0.0f) ? (value - min_v) / span : 0.0f;
+    t = clampf(t, 0.0f, 1.0f);
+    return track.x + (int)lroundf(t * (float)track.w);
+}
+
+static void compute_fft_bars(const float *samples, size_t n, float *bars)
+{
+    static float win[FRAMES_PER_BUFFER];
+    static int win_init = 0;
+    if (!win_init) {
+        for (size_t t = 0; t < FRAMES_PER_BUFFER; t++) {
+            win[t] = 0.5f - 0.5f * cosf(TWO_PI * (float)t / (float)(FRAMES_PER_BUFFER - 1));
+        }
+        win_init = 1;
+    }
+
+    const float hz_per_bin = (float)SAMPLE_RATE / (float)n;
+    const float span_hz = UI_FREQ_MAX_HZ - UI_FREQ_MIN_HZ;
+
+    for (int i = 0; i < UI_FFT_BARS; i++) {
+        float frac = (UI_FFT_BARS > 1)
+                   ? (float)i / (float)(UI_FFT_BARS - 1)
+                   : 0.0f;
+        float f_hz = UI_FREQ_MIN_HZ + frac * span_hz;
+        int   bin  = (int)lroundf(f_hz / hz_per_bin);
+        if (bin < 0) bin = 0;
+        if (bin >= (int)n / 2) bin = (int)n / 2 - 1;
+
+        float best_mag = 0.0f;
+        for (int db = -1; db <= 1; db++) {
+            int bb = bin + db;
+            if (bb < 0) bb = 0;
+            if (bb >= (int)n / 2) bb = (int)n / 2 - 1;
+
+            float re = 0.0f;
+            float im = 0.0f;
+            float w = TWO_PI * (float)bb / (float)n;
+            for (size_t t = 0; t < n; t++) {
+                float a = w * (float)t;
+                float s = samples[t] * win[t];
+                re += s * cosf(a);
+                im -= s * sinf(a);
+            }
+            float mag = sqrtf(re * re + im * im);
+            if (mag > best_mag) best_mag = mag;
+        }
+        bars[i] = best_mag;
+    }
+}
+
+static void render_tx_ui(SDL_Renderer *ren, TTF_Font *font,
+                         const float *bars,
+                         SDL_Rect chart,
+                         SDL_Rect panel,
+                         SDL_Rect tone_checkbox,
+                         SDL_Rect noise_checkbox,
+                         SDL_Rect freq_track,
+                         SDL_Rect intensity_track,
+                         SDL_Rect noise_track,
+                         int tone_enabled,
+                         float tone_freq_hz,
+                         float tone_intensity,
+                         int noise_enabled,
+                         float noise_intensity,
+                         float base_carrier_hz,
+                         size_t sym_idx,
+                         size_t n_syms)
+{
+    SDL_SetRenderDrawColor(ren, 7, 10, 18, 255);
+    SDL_RenderClear(ren);
+
+    SDL_SetRenderDrawColor(ren, 18, 24, 38, 255);
+    SDL_RenderFillRect(ren, &chart);
+    SDL_SetRenderDrawColor(ren, 38, 48, 73, 255);
+    SDL_RenderDrawRect(ren, &chart);
+
+    float max_mag = 1e-6f;
+    for (int i = 0; i < UI_FFT_BARS; i++)
+        if (bars[i] > max_mag) max_mag = bars[i];
+
+    int bar_w = SDL_max(2, chart.w / UI_FFT_BARS);
+    for (int i = 0; i < UI_FFT_BARS; i++) {
+        float nrm = bars[i] / max_mag;
+        int h = (int)(nrm * (float)(chart.h - 36));
+        if (h < 1) h = 1;
+        SDL_Rect br = {
+            chart.x + i * bar_w,
+            chart.y + chart.h - h - 1,
+            SDL_max(1, bar_w - 1),
+            h
+        };
+        SDL_SetRenderDrawColor(ren, 40, 175, 230, 255);
+        SDL_RenderFillRect(ren, &br);
+    }
+
+    SDL_Color text = {220, 228, 240, 255};
+    SDL_Color dim  = {120, 132, 150, 255};
+    char line[128];
+    int value_right_x = chart.x + chart.w - 14;
+
+    draw_text(ren, font, "Transmitter FFT", 42, 18, text);
+    snprintf(line, sizeof(line), "Base carrier: %.1f Hz", base_carrier_hz);
+    draw_text(ren, font, line, 42, 50, dim);
+    char sym_line[128];
+    snprintf(sym_line, sizeof(sym_line), "Symbols: %zu / %zu", sym_idx, n_syms);
+    int sym_x = chart.x + chart.w - text_width(font, sym_line) - 12;
+    int sym_y = 50;
+    if (sym_x < 330) {
+        sym_x = 42;
+        sym_y = 74;
+    }
+    draw_text(ren, font, sym_line, sym_x, sym_y, dim);
+
+    draw_text(ren, font, "Spectrum (20 Hz - 20 kHz)", chart.x + 8, chart.y + 8, dim);
+
+    SDL_SetRenderDrawColor(ren, 24, 31, 46, 255);
+    SDL_RenderDrawLine(ren, chart.x, chart.y + 28, chart.x + chart.w, chart.y + 28);
+
+    SDL_SetRenderDrawColor(ren, 30, 37, 54, 255);
+    SDL_RenderFillRect(ren, &panel);
+    SDL_SetRenderDrawColor(ren, 56, 67, 95, 255);
+    SDL_RenderDrawRect(ren, &panel);
+
+    draw_text(ren, font, "Tone Controls", panel.x + 12, panel.y + 8, text);
+    snprintf(line, sizeof(line), "Tone: %s", tone_enabled ? "ON" : "OFF");
+    draw_text(ren, font, line,
+              panel.x + panel.w - text_width(font, line) - 14,
+              panel.y + 8,
+              tone_enabled ? text : dim);
+    SDL_SetRenderDrawColor(ren, 46, 56, 82, 255);
+    SDL_RenderDrawLine(ren, panel.x + 10, panel.y + 34,
+                       panel.x + panel.w - 10, panel.y + 34);
+
+    SDL_SetRenderDrawColor(ren, 235, 235, 235, 255);
+    SDL_RenderDrawRect(ren, &tone_checkbox);
+    if (tone_enabled) {
+        SDL_RenderDrawLine(ren, tone_checkbox.x + 3, tone_checkbox.y + tone_checkbox.h / 2,
+                           tone_checkbox.x + tone_checkbox.w / 2, tone_checkbox.y + tone_checkbox.h - 4);
+        SDL_RenderDrawLine(ren, tone_checkbox.x + tone_checkbox.w / 2, tone_checkbox.y + tone_checkbox.h - 4,
+                           tone_checkbox.x + tone_checkbox.w - 3, tone_checkbox.y + 3);
+    }
+    draw_text(ren, font, "Enable pure sinusoid", tone_checkbox.x + tone_checkbox.w + 10, tone_checkbox.y - 2, text);
+
+    draw_text(ren, font, "Sinusoid frequency (20 Hz - 20 kHz)", freq_track.x, freq_track.y - 24,
+              tone_enabled ? text : dim);
+    SDL_SetRenderDrawColor(ren,
+                           tone_enabled ? 80 : 55,
+                           tone_enabled ? 140 : 70,
+                           tone_enabled ? 235 : 95,
+                           255);
+    SDL_Rect freq_line = {freq_track.x, freq_track.y + freq_track.h / 2 - 2, freq_track.w, 4};
+    SDL_RenderFillRect(ren, &freq_line);
+
+    int freq_knob_x = slider_knob_x(freq_track, tone_freq_hz, UI_FREQ_MIN_HZ, UI_FREQ_MAX_HZ);
+    SDL_Rect freq_knob = {freq_knob_x - 7, freq_track.y - 4, 14, freq_track.h + 8};
+    SDL_SetRenderDrawColor(ren,
+                           tone_enabled ? 240 : 110,
+                           tone_enabled ? 245 : 120,
+                           tone_enabled ? 255 : 140,
+                           255);
+    SDL_RenderFillRect(ren, &freq_knob);
+    char freq_line_text[32];
+    snprintf(freq_line_text, sizeof(freq_line_text), "%.0f Hz", tone_freq_hz);
+    draw_text(ren, font,
+              freq_line_text,
+              value_right_x - text_width(font, freq_line_text),
+              freq_track.y - 3,
+              tone_enabled ? text : dim);
+
+    draw_text(ren, font, "Sinusoid intensity", intensity_track.x, intensity_track.y - 24, text);
+    SDL_SetRenderDrawColor(ren, 90, 185, 120, 255);
+    SDL_Rect int_line = {intensity_track.x, intensity_track.y + intensity_track.h / 2 - 2,
+                         intensity_track.w, 4};
+    SDL_RenderFillRect(ren, &int_line);
+
+    int int_knob_x = slider_knob_x(intensity_track, tone_intensity, 0.0f, 1.0f);
+    SDL_Rect int_knob = {int_knob_x - 7, intensity_track.y - 4, 14, intensity_track.h + 8};
+    SDL_SetRenderDrawColor(ren, 220, 255, 230, 255);
+    SDL_RenderFillRect(ren, &int_knob);
+    char intensity_line_text[32];
+    snprintf(intensity_line_text, sizeof(intensity_line_text), "%.2f", tone_intensity);
+    draw_text(ren, font,
+              intensity_line_text,
+              value_right_x - text_width(font, intensity_line_text),
+              intensity_track.y - 3,
+              text);
+
+    SDL_SetRenderDrawColor(ren, 235, 235, 235, 255);
+    SDL_RenderDrawRect(ren, &noise_checkbox);
+    if (noise_enabled) {
+        SDL_RenderDrawLine(ren, noise_checkbox.x + 3, noise_checkbox.y + noise_checkbox.h / 2,
+                           noise_checkbox.x + noise_checkbox.w / 2, noise_checkbox.y + noise_checkbox.h - 4);
+        SDL_RenderDrawLine(ren, noise_checkbox.x + noise_checkbox.w / 2, noise_checkbox.y + noise_checkbox.h - 4,
+                           noise_checkbox.x + noise_checkbox.w - 3, noise_checkbox.y + 3);
+    }
+    draw_text(ren, font, "Enable Gaussian noise", noise_checkbox.x + noise_checkbox.w + 10,
+              noise_checkbox.y - 2, text);
+
+    draw_text(ren, font, "Noise intensity", noise_track.x, noise_track.y - 24,
+              noise_enabled ? text : dim);
+    SDL_SetRenderDrawColor(ren,
+                           noise_enabled ? 210 : 95,
+                           noise_enabled ? 125 : 95,
+                           noise_enabled ?  70 : 95,
+                           255);
+    SDL_Rect noise_line = {noise_track.x, noise_track.y + noise_track.h / 2 - 2,
+                           noise_track.w, 4};
+    SDL_RenderFillRect(ren, &noise_line);
+
+    int noise_knob_x = slider_knob_x(noise_track, noise_intensity, 0.0f, 1.0f);
+    SDL_Rect noise_knob = {noise_knob_x - 7, noise_track.y - 4, 14, noise_track.h + 8};
+    SDL_SetRenderDrawColor(ren,
+                           noise_enabled ? 250 : 135,
+                           noise_enabled ? 205 : 135,
+                           noise_enabled ? 180 : 135,
+                           255);
+    SDL_RenderFillRect(ren, &noise_knob);
+    float noise_sigma = noise_sigma_from_intensity(noise_intensity);
+    char noise_line_text[32];
+    snprintf(noise_line_text, sizeof(noise_line_text), "sigma %.3f", noise_sigma);
+    draw_text(ren, font,
+              noise_line_text,
+              value_right_x - text_width(font, noise_line_text),
+              noise_track.y - 3,
+              noise_enabled ? text : dim);
+
+    SDL_SetRenderDrawColor(ren, 46, 56, 82, 255);
+    SDL_RenderDrawLine(ren, panel.x + 10, panel.y + panel.h - 24,
+                       panel.x + panel.w - 10, panel.y + panel.h - 24);
+    draw_text(ren, font,
+              "Noise is full-band (20 Hz-20 kHz); value is Gaussian sigma per sample.",
+              42, panel.y + panel.h - 18, dim);
+}
+
 /* ═══════════════════════════════════════════════════════════════════
  * PortAudio callback state
  * ═══════════════════════════════════════════════════════════════════ */
@@ -255,6 +592,7 @@ typedef struct {
     int            num_carriers;
     float          two_pi_fc_over_n[MAX_NUM_CARRIERS];
     int            M;          /* PSK order                                */
+    tx_ui_state_t *ui;
 } cb_state_t;
 
 /* ═══════════════════════════════════════════════════════════════════
@@ -279,10 +617,14 @@ static int audio_callback(const void *inputBuffer, void *outputBuffer,
 
     cb_state_t *d = (cb_state_t *)userData;
     float      *o = (float *)outputBuffer;
+    tx_ui_state_t *ui = d->ui;
 
     /* All symbols sent — signal stream completion. */
     if (d->sym_idx >= d->n_syms)
         return paComplete;
+
+    if (ui)
+        ui->latest_seq++;
 
     /* Fill the output buffer */
     for (int t = 0; t < FRAMES_PER_BUFFER; t++) {
@@ -292,8 +634,33 @@ static int audio_callback(const void *inputBuffer, void *outputBuffer,
             float phase = (float)d->syms[idx] * TWO_PI / (float)d->M;
             sample += sinf(d->two_pi_fc_over_n[c] * (float)t + phase);
         }
-        o[t] = sample / (float)d->num_carriers;
+        sample /= (float)d->num_carriers;
+
+        if (ui && ui->tone_enabled) {
+            float tone = sinf(ui->tone_phase);
+            float tone_amp = clampf(ui->tone_intensity, 0.0f, 1.0f);
+            sample = (1.0f - tone_amp) * sample + tone_amp * tone;
+
+            ui->tone_phase += TWO_PI * ui->tone_freq_hz / (float)SAMPLE_RATE;
+            if (ui->tone_phase > TWO_PI)
+                ui->tone_phase -= TWO_PI;
+        }
+
+        if (ui && ui->noise_enabled) {
+            float sigma = noise_sigma_from_intensity(ui->noise_intensity);
+            sample += sigma * gaussian_randn(ui);
+        }
+
+        o[t] = clampf(sample, -1.0f, 1.0f);
+        if (ui)
+            ui->latest_buffer[t] = o[t];
     }
+
+    if (ui)
+        ui->latest_seq++;
+
+    if (ui)
+        ui->buffer_ready = 1;
 
     /* Advance buffer counter; roll over to next symbol when due */
     if (++d->buf_count >= (size_t)d->buffers_per_symbol) {
@@ -434,8 +801,8 @@ int main(int argc, char *argv[])
         int hz_c = carrier_hz + off * CARRIER_SPACING_HZ;
         if (hz_c <= 0 || hz_c >= MAX_CARRIER_HZ) {
             fprintf(stderr,
-                    "Error: -k %d with base carrier %d Hz yields out-of-range carrier %d (%d Hz).\n",
-                    num_carriers, carrier_hz, MAX_CARRIER_HZ - 1, c + 1, hz_c);
+                    "Error: -k %d with base carrier %d Hz yields out-of-range carrier #%d (%d Hz, limit 1..%d).\n",
+                    num_carriers, carrier_hz, c + 1, hz_c, MAX_CARRIER_HZ - 1);
             print_base_range_hint(num_carriers);
             return 1;
         }
@@ -586,6 +953,20 @@ int main(int argc, char *argv[])
     cb.buffers_per_symbol = buffers_per_symbol;
     cb.num_carriers = num_carriers;
     cb.M = M;
+
+    tx_ui_state_t ui_state;
+    memset(&ui_state, 0, sizeof(ui_state));
+    ui_state.tone_enabled = 0;
+    ui_state.tone_freq_hz = clampf(actual_carrier_hz, UI_FREQ_MIN_HZ, UI_FREQ_MAX_HZ);
+    ui_state.tone_intensity = 0.5f;
+    ui_state.tone_phase = 0.0f;
+    ui_state.noise_enabled = 0;
+    ui_state.noise_intensity = 0.15f;
+    ui_state.noise_rng_state = 0x1234A5C3u;
+    ui_state.noise_has_spare = 0;
+    ui_state.noise_spare = 0.0f;
+    cb.ui = &ui_state;
+
     for (int c = 0; c < num_carriers; c++) {
         int off = carrier_offset_index(c);
         int cyc = carrier_cycles + off * spacing_cycles;
@@ -613,8 +994,222 @@ int main(int argc, char *argv[])
         return 1;
     }
 
-    while (Pa_IsStreamActive(stream))
-        Pa_Sleep(100);
+    if (SDL_Init(SDL_INIT_VIDEO) < 0) {
+        fprintf(stderr, "SDL_Init: %s\n", SDL_GetError());
+        Pa_StopStream(stream);
+        Pa_CloseStream(stream);
+        Pa_Terminate();
+        free(all_syms);
+        return 1;
+    }
+    if (TTF_Init() < 0) {
+        fprintf(stderr, "TTF_Init: %s\n", TTF_GetError());
+        SDL_Quit();
+        Pa_StopStream(stream);
+        Pa_CloseStream(stream);
+        Pa_Terminate();
+        free(all_syms);
+        return 1;
+    }
+
+    SDL_Window *win = SDL_CreateWindow(
+        "M-PSK Transmitter — FFT + Sinusoid Controls",
+        SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
+        UI_WIN_W, UI_WIN_H,
+        SDL_WINDOW_SHOWN);
+    if (!win) {
+        fprintf(stderr, "SDL_CreateWindow: %s\n", SDL_GetError());
+        TTF_Quit();
+        SDL_Quit();
+        Pa_StopStream(stream);
+        Pa_CloseStream(stream);
+        Pa_Terminate();
+        free(all_syms);
+        return 1;
+    }
+
+    SDL_Renderer *ren = SDL_CreateRenderer(win, -1,
+        SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
+    if (!ren) {
+        fprintf(stderr, "SDL_CreateRenderer: %s\n", SDL_GetError());
+        SDL_DestroyWindow(win);
+        TTF_Quit();
+        SDL_Quit();
+        Pa_StopStream(stream);
+        Pa_CloseStream(stream);
+        Pa_Terminate();
+        free(all_syms);
+        return 1;
+    }
+
+    TTF_Font *font = NULL;
+    static const char *const font_paths[] = {
+        "/usr/share/fonts/adwaita-mono-fonts/AdwaitaMono-Regular.ttf",
+        "/usr/share/fonts/liberation-mono/LiberationMono-Regular.ttf",
+        "/usr/share/fonts/dejavu-sans-mono-fonts/DejaVuSansMono.ttf",
+        "/usr/share/fonts/dejavu/DejaVuSansMono.ttf",
+        NULL
+    };
+    for (int fp = 0; font_paths[fp] && !font; fp++)
+        font = TTF_OpenFont(font_paths[fp], 20);
+    if (!font)
+        fprintf(stderr, "Warning: no font found — UI text labels will be absent.\n");
+
+    SDL_SetWindowMinimumSize(win, 900, 760);
+
+    SDL_Rect chart = {0, 0, 0, 0};
+    SDL_Rect panel = {0, 0, 0, 0};
+    SDL_Rect tone_checkbox = {0, 0, 0, 0};
+    SDL_Rect freq_track = {0, 0, 0, 0};
+    SDL_Rect intensity_track = {0, 0, 0, 0};
+    SDL_Rect noise_checkbox = {0, 0, 0, 0};
+    SDL_Rect noise_track = {0, 0, 0, 0};
+
+    float bars[UI_FFT_BARS] = {0.0f};
+    float bars_smooth[UI_FFT_BARS] = {0.0f};
+    int dragging_freq = 0;
+    int dragging_intensity = 0;
+    int dragging_noise = 0;
+    int running = 1;
+
+    while (running) {
+        int win_w = UI_WIN_W;
+        int win_h = UI_WIN_H;
+        SDL_GetWindowSize(win, &win_w, &win_h);
+
+        int margin_x = SDL_max(20, win_w / 28);
+        int top_y = SDL_max(76, win_h / 14);
+        int gap = SDL_max(14, win_h / 44);
+        int bottom_margin = SDL_max(16, win_h / 44);
+        int panel_h = SDL_max(300, win_h / 3);
+        int chart_h = win_h - top_y - gap - panel_h - bottom_margin;
+        if (chart_h < 220) {
+            chart_h = 220;
+            panel_h = win_h - top_y - gap - chart_h - bottom_margin;
+            if (panel_h < 260) panel_h = 260;
+        }
+
+        chart.x = margin_x;
+        chart.y = top_y;
+        chart.w = win_w - 2 * margin_x;
+        chart.h = chart_h;
+
+        panel.x = margin_x;
+        panel.y = chart.y + chart.h + gap;
+        panel.w = chart.w;
+        panel.h = win_h - panel.y - bottom_margin;
+        if (panel.h < 260) panel.h = 260;
+
+        int track_x = panel.x + 24;
+        int track_w = panel.w - 140;
+        if (track_w < 260) track_w = 260;
+
+        int row0 = panel.y + 42;
+        int row1 = row0 + 42;
+        int row2 = row1 + 42;
+        int row3 = row2 + 54;
+        int row4 = row3 + 36;
+
+        tone_checkbox = (SDL_Rect){track_x, row0, 20, 20};
+        freq_track = (SDL_Rect){track_x, row1, track_w, 14};
+        intensity_track = (SDL_Rect){track_x, row2, track_w, 14};
+        noise_checkbox = (SDL_Rect){track_x, row3, 20, 20};
+        noise_track = (SDL_Rect){track_x, row4, track_w, 14};
+
+        int stream_active = Pa_IsStreamActive(stream);
+        if (stream_active < 0) {
+            fprintf(stderr, "Pa_IsStreamActive: %s\n", Pa_GetErrorText(stream_active));
+            break;
+        }
+        if (stream_active == 0)
+            break;
+
+        SDL_Event ev;
+        while (SDL_PollEvent(&ev)) {
+            if (ev.type == SDL_QUIT) {
+                running = 0;
+            } else if (ev.type == SDL_MOUSEBUTTONDOWN && ev.button.button == SDL_BUTTON_LEFT) {
+                int mx = ev.button.x;
+                int my = ev.button.y;
+                if (point_in_rect(mx, my, tone_checkbox)) {
+                    ui_state.tone_enabled = !ui_state.tone_enabled;
+                } else if (point_in_rect(mx, my, freq_track) && ui_state.tone_enabled) {
+                    dragging_freq = 1;
+                    ui_state.tone_freq_hz = slider_value_from_x(mx, freq_track,
+                                                                UI_FREQ_MIN_HZ, UI_FREQ_MAX_HZ);
+                } else if (point_in_rect(mx, my, intensity_track)) {
+                    dragging_intensity = 1;
+                    ui_state.tone_intensity = slider_value_from_x(mx, intensity_track, 0.0f, 1.0f);
+                } else if (point_in_rect(mx, my, noise_checkbox)) {
+                    ui_state.noise_enabled = !ui_state.noise_enabled;
+                } else if (point_in_rect(mx, my, noise_track) && ui_state.noise_enabled) {
+                    dragging_noise = 1;
+                    ui_state.noise_intensity = slider_value_from_x(mx, noise_track, 0.0f, 1.0f);
+                }
+            } else if (ev.type == SDL_MOUSEBUTTONUP && ev.button.button == SDL_BUTTON_LEFT) {
+                dragging_freq = 0;
+                dragging_intensity = 0;
+                dragging_noise = 0;
+            } else if (ev.type == SDL_MOUSEMOTION) {
+                int mx = ev.motion.x;
+                if (dragging_freq && ui_state.tone_enabled) {
+                    ui_state.tone_freq_hz = slider_value_from_x(mx, freq_track,
+                                                                UI_FREQ_MIN_HZ, UI_FREQ_MAX_HZ);
+                }
+                if (dragging_intensity) {
+                    ui_state.tone_intensity = slider_value_from_x(mx, intensity_track, 0.0f, 1.0f);
+                }
+                if (dragging_noise && ui_state.noise_enabled) {
+                    ui_state.noise_intensity = slider_value_from_x(mx, noise_track, 0.0f, 1.0f);
+                }
+            }
+        }
+
+        if (ui_state.buffer_ready) {
+            float snap[FRAMES_PER_BUFFER];
+            uint32_t s0, s1;
+            do {
+                s0 = ui_state.latest_seq;
+                if (s0 & 1u) continue;
+                memcpy(snap, ui_state.latest_buffer, sizeof(snap));
+                s1 = ui_state.latest_seq;
+            } while ((s0 != s1) || (s0 & 1u));
+
+            compute_fft_bars(snap, FRAMES_PER_BUFFER, bars);
+            for (int i = 0; i < UI_FFT_BARS; i++)
+                bars_smooth[i] = 0.88f * bars_smooth[i] + 0.12f * bars[i];
+            ui_state.buffer_ready = 0;
+        }
+
+        render_tx_ui(ren, font,
+                     bars_smooth,
+                     chart,
+                     panel,
+                     tone_checkbox,
+                     noise_checkbox,
+                     freq_track,
+                     intensity_track,
+                     noise_track,
+                     ui_state.tone_enabled,
+                     ui_state.tone_freq_hz,
+                     ui_state.tone_intensity,
+                     ui_state.noise_enabled,
+                     ui_state.noise_intensity,
+                     actual_carrier_hz,
+                     cb.sym_idx,
+                     cb.n_syms);
+        SDL_RenderPresent(ren);
+        SDL_Delay(16);
+    }
+
+    if (!running)
+        Pa_StopStream(stream);
+
+    if (font) TTF_CloseFont(font);
+    SDL_DestroyRenderer(ren);
+    SDL_DestroyWindow(win);
+    TTF_Quit();
+    SDL_Quit();
 
     Pa_CloseStream(stream);
     Pa_Terminate();

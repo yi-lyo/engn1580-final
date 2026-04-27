@@ -108,15 +108,17 @@ static int   g_num_carriers = 1;
 #define BAR_WIDTH  100
 #define BAR_PX_W    11
 
+#define ANALYSIS_BINS (FRAMES_PER_BUFFER / 2 + 1)
+
 #define FFT_DISPLAY_MIN_HZ 20.0f
 #define FFT_DISPLAY_MAX_HZ 20000.0f
 
 #define AXIS_Y   (CHART_Y + CHART_H + 12)   /* Hz tick labels               */
 #define INFO_Y   (AXIS_Y + 42)              /* carrier magnitude/phase row  */
 #define INFO2_Y  (INFO_Y + 34)              /* symbol/state row             */
-#define SYNC_Y   (INFO2_Y + 40)             /* timing + PLL row             */
-#define STAT_Y   (SYNC_Y + 36)              /* SNR / FEC / interference row */
-#define HINT_Y   (STAT_Y + 36)              /* keyboard hint                */
+#define SYNC_Y   (INFO2_Y + 44)             /* timing + PLL row             */
+#define STAT_Y   (SYNC_Y + 44)              /* SNR / FEC / interference row */
+#define HINT_Y   (STAT_Y + 56)              /* keyboard hint                */
 
 /* ── Decoded output panel (full-width strip at the bottom) ─────── */
 #define OUTPUT_X   CHART_X                  /* left-aligned with FFT chart   */
@@ -294,6 +296,73 @@ static int gray_decode(int g)
     return n;
 }
 
+static float qfunc(float x)
+{
+    return 0.5f * erfcf(x * 0.70710678118f);
+}
+
+static float estimate_system_snr_db(const float *magnitudes,
+                                    int n_bins,
+                                    const int *carrier_bins,
+                                    int num_carriers)
+{
+    const int guard = PSK_SNR_GUARD;
+    float sig2_sum = 0.0f;
+    for (int c = 0; c < num_carriers; c++) {
+        int kb = carrier_bins[c];
+        if (kb >= 0 && kb < n_bins)
+            sig2_sum += magnitudes[kb] * magnitudes[kb];
+    }
+
+    float noise_sum = 0.0f;
+    int noise_cnt = 0;
+    for (int k = 0; k < n_bins; k++) {
+        int near_any_carrier = 0;
+        for (int c = 0; c < num_carriers; c++) {
+            int d = k - carrier_bins[c];
+            if (d < 0) d = -d;
+            if (d <= guard) {
+                near_any_carrier = 1;
+                break;
+            }
+        }
+        if (near_any_carrier) continue;
+        noise_sum += magnitudes[k] * magnitudes[k];
+        noise_cnt++;
+    }
+
+    if (sig2_sum < 1e-20f) return -60.0f;
+    if (noise_cnt == 0 || noise_sum < 1e-20f) return 60.0f;
+
+    float noise_avg = noise_sum / (float)noise_cnt;
+    float sig_avg = sig2_sum / (float)SDL_max(num_carriers, 1);
+    return 10.0f * log10f(sig_avg / noise_avg);
+}
+
+static void estimate_mpsk_error_prob(int M, float snr_db,
+                                     float *out_ser, float *out_ber)
+{
+    float gamma_s = powf(10.0f, snr_db / 10.0f);
+    if (gamma_s < 1e-9f) gamma_s = 1e-9f;
+
+    float ser;
+    if (M <= 2) {
+        ser = qfunc(sqrtf(2.0f * gamma_s));
+    } else {
+        float theta = (float)M_PI / (float)M;
+        float arg = sqrtf(2.0f * gamma_s) * sinf(theta);
+        ser = 2.0f * qfunc(arg);
+        if (ser > 1.0f) ser = 1.0f;
+    }
+
+    int bps = ilog2(M);
+    float ber = (bps > 0) ? (ser / (float)bps) : ser;
+    if (ber > 1.0f) ber = 1.0f;
+
+    *out_ser = ser;
+    *out_ber = ber;
+}
+
 /* ───────────────────────────────────────────────────────────────────
  * audio_callback
  *
@@ -347,12 +416,15 @@ static int audio_callback(const void *inputBuffer, void *outputBuffer,
 /* ───────────────────────────────────────────────────────────────────
  * compute_dft
  *
- * Analysis DFT for bins [0 … BAR_WIDTH-1].
+ * Analysis DFT for bins [0 … n_bins-1] (up to N/2+1).
  * Used by SNR/interference stats and demod support logic.
  * ─────────────────────────────────────────────────────────────────── */
-static void compute_dft(const float *samples, size_t n, float *magnitudes)
+static void compute_dft(const float *samples, size_t n,
+                        float *magnitudes, int n_bins)
 {
-    for (int k = 0; k < BAR_WIDTH; k++) {
+    int max_bins = (int)(n / 2) + 1;
+    if (n_bins > max_bins) n_bins = max_bins;
+    for (int k = 0; k < n_bins; k++) {
         float complex w  = cexpf(-I * 2.0f * M_PI * (float)k / (float)n);
         float complex wt = 1.0f;
         float complex X  = 0.0f;
@@ -374,6 +446,16 @@ static void compute_dft(const float *samples, size_t n, float *magnitudes)
 static void compute_display_spectrum(const float *samples, size_t n,
                                      float *display_mag)
 {
+    static float win[FRAMES_PER_BUFFER];
+    static int win_init = 0;
+    if (!win_init) {
+        for (size_t t = 0; t < FRAMES_PER_BUFFER; t++) {
+            win[t] = 0.5f - 0.5f * cosf(2.0f * (float)M_PI * (float)t
+                                        / (float)(FRAMES_PER_BUFFER - 1));
+        }
+        win_init = 1;
+    }
+
     const float hz_per_bin = (float)SAMPLE_RATE / (float)n;
     const float span_hz = FFT_DISPLAY_MAX_HZ - FFT_DISPLAY_MIN_HZ;
 
@@ -385,14 +467,23 @@ static void compute_display_spectrum(const float *samples, size_t n,
         if (bin < 0) bin = 0;
         if (bin > (int)n / 2) bin = (int)n / 2;
 
-        float complex w  = cexpf(-I * 2.0f * M_PI * (float)bin / (float)n);
-        float complex wt = 1.0f;
-        float complex X  = 0.0f;
-        for (size_t t = 0; t < n; t++) {
-            X  += samples[t] * wt;
-            wt *= w;
+        float best_mag = 0.0f;
+        for (int db = -1; db <= 1; db++) {
+            int bb = bin + db;
+            if (bb < 0) bb = 0;
+            if (bb > (int)n / 2) bb = (int)n / 2;
+
+            float complex w  = cexpf(-I * 2.0f * (float)M_PI * (float)bb / (float)n);
+            float complex wt = 1.0f;
+            float complex X  = 0.0f;
+            for (size_t t = 0; t < n; t++) {
+                X  += (samples[t] * win[t]) * wt;
+                wt *= w;
+            }
+            float mag = cabsf(X) / (float)n;
+            if (mag > best_mag) best_mag = mag;
         }
-        display_mag[i] = cabsf(X) / (float)n;
+        display_mag[i] = best_mag;
     }
 }
 
@@ -903,6 +994,8 @@ static void render_frame(SDL_Renderer *ren, TTF_Font *font,
                           float carrier_mag, float carrier_phase_deg,
                           int current_sym, int current_bits,
                           int rx_state, int M, float live_rate_bps,
+                          float err_snr_db,
+                          int empirical_available, float empirical_corr_rate,
                           int sym_windows_cfg, int decode_window_idx,
                           /* timing recovery */
                           int sym_window, int is_boundary, int timing_locked,
@@ -918,6 +1011,7 @@ static void render_frame(SDL_Renderer *ren, TTF_Font *font,
     const float display_hz_per_bar =
         (BAR_WIDTH > 1) ? span_hz / (float)(BAR_WIDTH - 1) : 0.0f;
     int carrier_display_bins[MAX_NUM_CARRIERS] = {0};
+
     for (int c = 0; c < g_num_carriers; c++) {
         int bin = (int)lroundf((g_carrier_hzs[c] - FFT_DISPLAY_MIN_HZ)
                                / display_hz_per_bar);
@@ -949,6 +1043,7 @@ static void render_frame(SDL_Renderer *ren, TTF_Font *font,
         int ly = 48;
         const int line_h = 24;
         const int max_x = CHART_X + CHART_W - 20;
+        const int max_y = CHART_Y - 18;
         for (int k = 0; k < g_num_carriers; k++) {
             char lbuf[40];
             snprintf(lbuf, sizeof(lbuf), "C%d %.0fHz", k + 1, g_carrier_hzs[k]);
@@ -961,6 +1056,17 @@ static void render_frame(SDL_Renderer *ren, TTF_Font *font,
             if (lx + entry_w > max_x) {
                 lx = CHART_X;
                 ly += line_h;
+            }
+
+            if (ly > max_y) {
+                int remaining = g_num_carriers - k;
+                if (remaining > 0) {
+                    char mbuf[32];
+                    snprintf(mbuf, sizeof(mbuf), "+%d more", remaining);
+                    SDL_Color mc = {110, 110, 150, 255};
+                    draw_text(ren, font, mbuf, lx, max_y, mc);
+                }
+                break;
             }
 
             SDL_Color cc = carrier_color(k);
@@ -1149,9 +1255,11 @@ static void render_frame(SDL_Renderer *ren, TTF_Font *font,
     {
         SDL_Color dim = {70, 70, 100, 255};
         int x = CHART_X;
+        int row1_y = STAT_Y + 4;
+        int row2_y = STAT_Y + 22;
 
         /* SNR bar */
-        draw_text(ren, font, "SNR:", x, STAT_Y + 4, dim);
+        draw_text(ren, font, "SNR:", x, row1_y, dim);
         x += 38;
 
         {
@@ -1187,21 +1295,21 @@ static void render_frame(SDL_Renderer *ren, TTF_Font *font,
             SDL_Color sc = snr_db >= 20.0f ? (SDL_Color){0, 200, 100, 255} :
                            snr_db >= 10.0f ? (SDL_Color){200, 170, 0, 255} :
                                              (SDL_Color){210, 60, 30, 255};
-            draw_text(ren, font, snr_buf, x, STAT_Y + 4, sc);
+            draw_text(ren, font, snr_buf, x, row1_y, sc);
         }
         x += 70;
 
         /* Interference indicator */
         if (interference) {
-            float hz_per_bin = (float)SAMPLE_RATE / (float)FRAMES_PER_BUFFER;
-            char intf_buf[64];
-            snprintf(intf_buf, sizeof(intf_buf),
-                     "\xe2\x9a\xa0 INTF @ bin %d (%.0f Hz)",
-                     intf_bin, (float)intf_bin * hz_per_bin);
-            SDL_Color ic = {220, 100, 20, 255};
-            draw_text(ren, font, intf_buf, x, STAT_Y + 4, ic);
-            x += 200;
-        }
+                float hz_per_bin = (float)SAMPLE_RATE / (float)FRAMES_PER_BUFFER;
+                char intf_buf[64];
+                snprintf(intf_buf, sizeof(intf_buf),
+                         "\xe2\x9a\xa0 INTF %d (%.0fHz)",
+                         intf_bin, (float)intf_bin * hz_per_bin);
+                SDL_Color ic = {220, 100, 20, 255};
+                draw_text(ren, font, intf_buf, x, row1_y, ic);
+                x += 150;
+            }
 
         /* Live data-rate readout */
         {
@@ -1210,13 +1318,16 @@ static void render_frame(SDL_Renderer *ren, TTF_Font *font,
             SDL_Color rc = live_rate_bps >= 200.0f ? (SDL_Color){0, 200, 110, 255} :
                            live_rate_bps >= 50.0f  ? (SDL_Color){200, 170, 0, 255} :
                                                      (SDL_Color){210, 80, 40, 255};
-            draw_text(ren, font, rate_buf, x, STAT_Y + 4, rc);
+            draw_text(ren, font, rate_buf, x, row1_y, rc);
 
             int rate_w = 120;
             if (font && TTF_SizeUTF8(font, rate_buf, &rate_w, NULL) != 0)
                 rate_w = 120;
             x += rate_w + 12;
         }
+
+        /* Row 2 starts at left to avoid overlap with long row-1 content */
+        int x2 = CHART_X;
 
         /* FEC statistics */
         if (fec_enabled) {
@@ -1227,10 +1338,78 @@ static void render_frame(SDL_Renderer *ren, TTF_Font *font,
             SDL_Color fc = fec_corrections > 0
                 ? (SDL_Color){  0, 200, 140, 255}
                 : (SDL_Color){ 80, 130, 160, 255};
-            draw_text(ren, font, fec_buf, x, STAT_Y + 4, fc);
+            draw_text(ren, font, fec_buf, x2, row2_y, fc);
+            int fec_w = 210;
+            if (font && TTF_SizeUTF8(font, fec_buf, &fec_w, NULL) != 0)
+                fec_w = 210;
+            x2 += fec_w + 16;
         } else {
-            draw_text(ren, font, "FEC: off  (-e to enable)",
-                      x, STAT_Y + 4, dim);
+            const char *fec_off = "FEC: off  (-e to enable)";
+            draw_text(ren, font, fec_off, x2, row2_y, dim);
+            int fec_w = 170;
+            if (font && TTF_SizeUTF8(font, fec_off, &fec_w, NULL) != 0)
+                fec_w = 170;
+            x2 += fec_w + 16;
+        }
+
+        /* Real-time probability-of-error estimate (from live SNR)
+         * SER = symbol-error probability, BER = bit-error probability. */
+        {
+            char pe_buf[160];
+            SDL_Color pc = dim;
+            static float ser_avg = 1.0f;
+            static float ber_avg = 0.5f;
+            static int   pe_init = 0;
+            const float alpha = 0.12f; /* rolling-average weight */
+            if (rx_state == 2) {
+                float ser_now = 1.0f, ber_now = 0.5f;
+                estimate_mpsk_error_prob(M, err_snr_db, &ser_now, &ber_now);
+
+                if (!pe_init) {
+                    ser_avg = ser_now;
+                    ber_avg = ber_now;
+                    pe_init = 1;
+                } else {
+                    ser_avg = (1.0f - alpha) * ser_avg + alpha * ser_now;
+                    ber_avg = (1.0f - alpha) * ber_avg + alpha * ber_now;
+                }
+
+                float ser_pct = 100.0f * ser_avg;
+                float ber_pct = 100.0f * ber_avg;
+                snprintf(pe_buf, sizeof(pe_buf),
+                         "P(err est): SER %.1e (%.1f%%) BER %.1e (%.1f%%)",
+                         ser_avg, ser_pct, ber_avg, ber_pct);
+
+                pc = ber_avg < 1e-3f ? (SDL_Color){0, 200, 110, 255} :
+                     ber_avg < 1e-2f ? (SDL_Color){200, 170, 0, 255} :
+                                       (SDL_Color){210, 80, 40, 255};
+            } else {
+                snprintf(pe_buf, sizeof(pe_buf),
+                         "P(err est): SER --- BER ---");
+                pc = dim;
+            }
+
+            draw_text(ren, font, pe_buf, x2, row2_y, pc);
+            int pe_w = 360;
+            if (font && TTF_SizeUTF8(font, pe_buf, &pe_w, NULL) != 0)
+                pe_w = 360;
+            x2 += pe_w + 16;
+
+            char emp_buf[128];
+            SDL_Color ec = {95, 95, 130, 255};
+            if (empirical_available) {
+                float emp_pct = 100.0f * empirical_corr_rate;
+                snprintf(emp_buf, sizeof(emp_buf),
+                         "Emp(FEC): %.2e (%.2f%%)",
+                         empirical_corr_rate, emp_pct);
+                ec = empirical_corr_rate < 1e-3f ? (SDL_Color){0, 180, 105, 255} :
+                     empirical_corr_rate < 1e-2f ? (SDL_Color){180, 150, 0, 255} :
+                                                  (SDL_Color){190, 75, 35, 255};
+            } else {
+                snprintf(emp_buf, sizeof(emp_buf),
+                         "Emp(FEC): N/A");
+            }
+            draw_text(ren, font, emp_buf, x2, row2_y, ec);
         }
     }
 
@@ -1636,8 +1815,8 @@ int main(int argc, char *argv[])
         int hz_c = carrier_hz + off * CARRIER_SPACING_HZ;
         if (hz_c <= 0 || hz_c >= MAX_CARRIER_HZ) {
             fprintf(stderr,
-                    "Error: -k %d with base carrier %d Hz yields out-of-range carrier %d (%d Hz).\n",
-                    num_carriers, carrier_hz, MAX_CARRIER_HZ - 1, c + 1, hz_c);
+                    "Error: -k %d with base carrier %d Hz yields out-of-range carrier #%d (%d Hz, limit 1..%d).\n",
+                    num_carriers, carrier_hz, c + 1, hz_c, MAX_CARRIER_HZ - 1);
             print_base_range_hint(num_carriers);
             return 1;
         }
@@ -1705,6 +1884,11 @@ int main(int argc, char *argv[])
         fprintf(stderr, "SDL_CreateRenderer: %s\n", SDL_GetError());
         SDL_DestroyWindow(win); TTF_Quit(); SDL_Quit();
         return 1;
+    }
+
+    SDL_SetWindowMinimumSize(win, 1200, 760);
+    if (SDL_RenderSetLogicalSize(ren, WIN_W, WIN_H) < 0) {
+        fprintf(stderr, "SDL_RenderSetLogicalSize: %s\n", SDL_GetError());
     }
 
     /* ── monospace font ──────────────────────────────────────────── */
@@ -1808,11 +1992,13 @@ int main(int argc, char *argv[])
 
         /* ── main event / render loop ─────────────────────────────── */
         float local_samples[FRAMES_PER_BUFFER];
-        float analysis_magnitudes[BAR_WIDTH];
+        float analysis_magnitudes[ANALYSIS_BINS];
+        float display_magnitudes_raw[BAR_WIDTH];
         float display_magnitudes[BAR_WIDTH];
         float peaks[BAR_WIDTH];
 
         memset(analysis_magnitudes, 0, sizeof(analysis_magnitudes));
+        memset(display_magnitudes_raw, 0, sizeof(display_magnitudes_raw));
         memset(display_magnitudes, 0, sizeof(display_magnitudes));
         memset(peaks,      0, sizeof(peaks));
 
@@ -1939,13 +2125,17 @@ int main(int argc, char *argv[])
         float carrier_mag_c[MAX_NUM_CARRIERS] = {0};
         float carrier_mag = 0.0f;
         float live_rate_bps = 0.0f;
+        float err_snr_db = -60.0f;
+        size_t empirical_corr_bits = 0;
+        size_t empirical_total_coded_bits = 0;
         uint32_t rate_start_ticks = 0;
         size_t   rate_start_bits  = 0;
         int current_bits_c[MAX_NUM_CARRIERS] = {0};
 
         /* Initial blank frame */
         render_frame(ren, font, display_magnitudes, peaks,
-                     0.0f, 0.0f, 0, 0, rx_state, M, 0.0f,
+                     0.0f, 0.0f, 0, 0, rx_state, M, 0.0f, err_snr_db,
+                     0, 0.0f,
                      sym_windows_cfg, decode_window_idx,
                      sym_window, is_boundary, timing_locked, pll_error_deg,
                      snr_db, interference, intf_bin,
@@ -1995,22 +2185,31 @@ int main(int argc, char *argv[])
             }
 
             /* ── compute FFT data for analysis + display ─────────── */
-            compute_dft(local_samples, FRAMES_PER_BUFFER, analysis_magnitudes);
+            compute_dft(local_samples, FRAMES_PER_BUFFER,
+                        analysis_magnitudes, ANALYSIS_BINS);
             compute_display_spectrum(local_samples, FRAMES_PER_BUFFER,
-                                     display_magnitudes);
+                                     display_magnitudes_raw);
+            for (int k = 0; k < BAR_WIDTH; k++)
+                display_magnitudes[k] = 0.88f * display_magnitudes[k]
+                                      + 0.12f * display_magnitudes_raw[k];
 
 
 
             /* ── channel quality estimates ──────────────────────── */
-            if (g_carrier_bin >= 0 && g_carrier_bin < BAR_WIDTH) {
-                snr_db = psk_snr_estimate_db(analysis_magnitudes, BAR_WIDTH,
+            if (g_carrier_bin >= 0 && g_carrier_bin < ANALYSIS_BINS) {
+                snr_db = psk_snr_estimate_db(analysis_magnitudes, ANALYSIS_BINS,
                                              g_carrier_bin);
-                interference = psk_detect_interference(analysis_magnitudes, BAR_WIDTH,
+                interference = psk_detect_interference(analysis_magnitudes, ANALYSIS_BINS,
                                                        g_carrier_bin, &intf_bin);
+                err_snr_db = estimate_system_snr_db(analysis_magnitudes,
+                                                    ANALYSIS_BINS,
+                                                    g_carrier_bins,
+                                                    num_carriers);
             } else {
                 snr_db = -60.0f;
                 interference = 0;
                 intf_bin = 0;
+                err_snr_db = -60.0f;
             }
 
             /* ── derived carrier quantities ─────────────────────── */
@@ -2456,6 +2655,11 @@ int main(int argc, char *argv[])
                     if (out_n > 64) fputs("…", stderr);
                     fputs("\"\n", stderr);
 
+                    if (fec_enabled && out_n > 0) {
+                        if (corr > 0) empirical_corr_bits += (size_t)corr;
+                        empirical_total_coded_bits += out_n * 14u;
+                    }
+
                     free(dec);
                 }
 
@@ -2574,9 +2778,16 @@ int main(int argc, char *argv[])
             }
 
             /* ── render both panels, then present ───────────────── */
+            int empirical_available = (fec_enabled && empirical_total_coded_bits > 0);
+            float empirical_corr_rate = empirical_available
+                ? ((float)empirical_corr_bits / (float)empirical_total_coded_bits)
+                : 0.0f;
+
             render_frame(ren, font, display_magnitudes, peaks,
                          carrier_mag, carrier_phase_deg,
                          current_sym, current_bits, rx_state, M, live_rate_bps,
+                         err_snr_db,
+                         empirical_available, empirical_corr_rate,
                          sym_windows_cfg, decode_window_idx,
                          sym_window, is_boundary, timing_locked,
                          pll_error_deg,
