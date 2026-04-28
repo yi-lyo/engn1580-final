@@ -63,6 +63,7 @@
 #define DEFAULT_NUM_CARRIERS   1
 #define MAX_NUM_CARRIERS      32
 #define CARRIER_SPACING_HZ     375
+#define FSK_TONE_SPACING_HZ    125
 #define MAX_CARRIER_HZ       20000
 #define PREAMBLE_SYMBOLS     20       /* phase-0° symbols sent before data       */
 
@@ -86,6 +87,11 @@
 
 static const float TWO_PI          = 2.0f * (float)M_PI;
 
+typedef enum {
+    MOD_PSK = 0,
+    MOD_FSK = 1
+} modulation_t;
+
 /* ═══════════════════════════════════════════════════════════════════
  * Helper functions
  * ═══════════════════════════════════════════════════════════════════ */
@@ -94,6 +100,24 @@ static const float TWO_PI          = 2.0f * (float)M_PI;
 static int is_power_of_2(int n)
 {
     return (n >= 2) && ((n & (n - 1)) == 0);
+}
+
+static int parse_modulation(const char *s, modulation_t *out)
+{
+    if (strcmp(s, "psk") == 0) {
+        *out = MOD_PSK;
+        return 1;
+    }
+    if (strcmp(s, "fsk") == 0) {
+        *out = MOD_FSK;
+        return 1;
+    }
+    return 0;
+}
+
+static const char *modulation_name(modulation_t mod)
+{
+    return (mod == MOD_FSK) ? "FSK" : "PSK";
 }
 
 /* Integer log base-2 (valid only for exact powers of two). */
@@ -146,8 +170,7 @@ static int parse_buffers_per_symbol(const char *s, int *out_bpsym)
     char *ep;
     long v = strtol(s, &ep, 10);
     if (*ep != '\0') return 0;
-    if (v < MIN_BUFFERS_PER_SYMBOL) return 0;
-    if ((v % 16) != 0) return 0;
+    if (v < 1) return 0;
     *out_bpsym = (int)v;
     return 1;
 }
@@ -218,6 +241,7 @@ static int gray_encode(int n)
  * ═══════════════════════════════════════════════════════════════════ */
 static uint8_t *bytes_to_symbols_mc(const uint8_t *data, size_t data_len,
                                     int bps, int num_carriers,
+                                    int use_gray,
                                     size_t *out_symbol_count)
 {
     size_t total_bits = data_len * 8;
@@ -243,7 +267,8 @@ static uint8_t *bytes_to_symbols_mc(const uint8_t *data, size_t data_len,
                 }
                 raw = (raw << 1) | bit;
             }
-            syms[s * (size_t)num_carriers + (size_t)c] = (uint8_t)gray_encode(raw);
+            syms[s * (size_t)num_carriers + (size_t)c] =
+                (uint8_t)(use_gray ? gray_encode(raw) : raw);
         }
     }
 
@@ -591,7 +616,10 @@ typedef struct {
     int            buffers_per_symbol;
     int            num_carriers;
     float          two_pi_fc_over_n[MAX_NUM_CARRIERS];
+    float          two_pi_df_over_n;
+    float          fsk_phase[MAX_NUM_CARRIERS];
     int            M;          /* PSK order                                */
+    modulation_t   modulation;
     tx_ui_state_t *ui;
 } cb_state_t;
 
@@ -631,8 +659,17 @@ static int audio_callback(const void *inputBuffer, void *outputBuffer,
         float sample = 0.0f;
         for (int c = 0; c < d->num_carriers; c++) {
             size_t idx = d->sym_idx * (size_t)d->num_carriers + (size_t)c;
-            float phase = (float)d->syms[idx] * TWO_PI / (float)d->M;
-            sample += sinf(d->two_pi_fc_over_n[c] * (float)t + phase);
+            if (d->modulation == MOD_FSK) {
+                float omega = d->two_pi_fc_over_n[c]
+                            + d->two_pi_df_over_n * (float)d->syms[idx];
+                sample += sinf(d->fsk_phase[c]);
+                d->fsk_phase[c] += omega;
+                if (d->fsk_phase[c] > TWO_PI) d->fsk_phase[c] -= TWO_PI;
+                if (d->fsk_phase[c] < 0.0f) d->fsk_phase[c] += TWO_PI;
+            } else {
+                float phase = (float)d->syms[idx] * TWO_PI / (float)d->M;
+                sample += sinf(d->two_pi_fc_over_n[c] * (float)t + phase);
+            }
         }
         sample /= (float)d->num_carriers;
 
@@ -685,6 +722,7 @@ int main(int argc, char *argv[])
     int         carrier_hz = DEFAULT_CARRIER_CYCLES * SAMPLE_RATE / FRAMES_PER_BUFFER;
     int         buffers_per_symbol = DEFAULT_BUFFERS_PER_SYMBOL;
     int         num_carriers = DEFAULT_NUM_CARRIERS;
+    modulation_t modulation = MOD_PSK;
     const char *input_file = NULL; /* NULL → read from stdin          */
 
     for (int a = 1; a < argc; a++) {
@@ -705,6 +743,17 @@ int main(int argc, char *argv[])
                     "Error: M=%d is not a power of 2 (must be ≥ 2).\n"
                     "  Valid values: 2 (BPSK), 4 (QPSK), 8, 16, 32 …\n",
                     M);
+                return 1;
+            }
+        } else if (strcmp(argv[a], "-t") == 0) {
+            if (a + 1 >= argc) {
+                fprintf(stderr, "Error: -t requires an argument (psk|fsk).\n");
+                return 1;
+            }
+            if (!parse_modulation(argv[++a], &modulation)) {
+                fprintf(stderr,
+                        "Error: invalid modulation '%s' (must be 'psk' or 'fsk').\n",
+                        argv[a]);
                 return 1;
             }
         } else if (strcmp(argv[a], "-c") == 0) {
@@ -735,10 +784,10 @@ int main(int argc, char *argv[])
             }
             if (!parse_buffers_per_symbol(argv[++a], &buffers_per_symbol)) {
                 fprintf(stderr,
-                        "Error: invalid -s value '%s' (must be integer >= 32 and divisible by 16).\n",
+                        "Error: invalid -s value '%s' (must be integer >= 1).\n",
                         argv[a]);
                 fprintf(stderr,
-                        "       Example values: 32, 48, 64.\n");
+                        "       Example values: 4, 8, 16, 32.\n");
                 return 1;
             }
         } else if (strcmp(argv[a], "-k") == 0) {
@@ -767,18 +816,35 @@ int main(int argc, char *argv[])
         } else {
             fprintf(stderr,
                 "Unknown argument: %s\n"
-                "Usage: %s [-m M] [-c FREQ_HZ] [-s BUFS] [-k CARRIERS] [-e] [-d DEPTH] [-i INPUT_FILE]\n"
+                "Usage: %s [-t psk|fsk] [-m M] [-c FREQ_HZ] [-s BUFS] [-k CARRIERS] [-e] [-d DEPTH] [-i INPUT_FILE]\n"
+                "  -t MODE   modulation mode: psk (default) or fsk\n"
                 "  -c HZ     carrier frequency in Hz (integer, < %d)\n"
-                "  -s N      TX buffers/symbol (>= %d, divisible by 16)\n"
+                "  -s N      TX buffers/symbol (>= 1)\n"
                 "  -k N      number of parallel carriers (1..%d, spacing %d Hz)\n"
                 "  -i FILE   read payload from FILE instead of stdin\n",
-                argv[a], argv[0], MAX_CARRIER_HZ, MIN_BUFFERS_PER_SYMBOL,
+                argv[a], argv[0], MAX_CARRIER_HZ,
                 MAX_NUM_CARRIERS, CARRIER_SPACING_HZ);
             return 1;
         }
     }
 
-    if (((long)carrier_hz * FRAMES_PER_BUFFER) % SAMPLE_RATE != 0) {
+    if (modulation == MOD_FSK && num_carriers != 1) {
+        fprintf(stderr,
+                "Error: FSK currently supports exactly one carrier (omit -k or use -k 1).\n");
+        return 1;
+    }
+
+    if (modulation == MOD_FSK) {
+        int max_tone_hz = carrier_hz + (M - 1) * FSK_TONE_SPACING_HZ;
+        if (max_tone_hz >= MAX_CARRIER_HZ) {
+            fprintf(stderr,
+                    "Error: FSK tones exceed limit with -m %d and -c %d Hz (highest tone %d Hz, limit %d Hz).\n",
+                    M, carrier_hz, max_tone_hz, MAX_CARRIER_HZ - 1);
+            return 1;
+        }
+    }
+
+    if (modulation != MOD_FSK && ((long)carrier_hz * FRAMES_PER_BUFFER) % SAMPLE_RATE != 0) {
         int nearest = nearest_compatible_hz(carrier_hz);
         fprintf(stderr,
                 "Error: carrier %d Hz is incompatible with %d Hz sample rate and %d-sample TX buffers.\n",
@@ -806,7 +872,7 @@ int main(int argc, char *argv[])
             print_base_range_hint(num_carriers);
             return 1;
         }
-        if (((long)hz_c * FRAMES_PER_BUFFER) % SAMPLE_RATE != 0) {
+        if (modulation != MOD_FSK && ((long)hz_c * FRAMES_PER_BUFFER) % SAMPLE_RATE != 0) {
             fprintf(stderr,
                     "Error: derived carrier %d Hz is incompatible with sample timing.\n",
                     hz_c);
@@ -816,7 +882,9 @@ int main(int argc, char *argv[])
 
     int bps = ilog2(M);
     float actual_carrier_hz =
-        (float)carrier_cycles * SAMPLE_RATE / FRAMES_PER_BUFFER;
+        (modulation == MOD_FSK)
+            ? (float)carrier_hz
+            : (float)carrier_cycles * SAMPLE_RATE / FRAMES_PER_BUFFER;
     float raw_rate_bps =
         (float)(bps * num_carriers) * (float)SAMPLE_RATE
         / ((float)buffers_per_symbol * (float)FRAMES_PER_BUFFER);
@@ -824,8 +892,8 @@ int main(int argc, char *argv[])
                  * (float)FRAMES_PER_BUFFER / (float)SAMPLE_RATE;
 
     fprintf(stderr,
-            "%d-PSK transmitter — %d carrier%s, %d bit%s/symbol each, base %.1f Hz, symbol %.1f ms, raw %.1f bps%s\n",
-            M, num_carriers, num_carriers == 1 ? "" : "s",
+            "%d-%s transmitter — %d carrier%s, %d bit%s/symbol each, base %.1f Hz, symbol %.1f ms, raw %.1f bps%s\n",
+            M, modulation_name(modulation), num_carriers, num_carriers == 1 ? "" : "s",
             bps, bps == 1 ? "" : "s", actual_carrier_hz,
             sym_ms, raw_rate_bps,
             fec ? " [FEC on]" : "");
@@ -877,7 +945,8 @@ int main(int argc, char *argv[])
 
     /* ── convert bytes → Gray-coded M-PSK symbols ─────────────────── */
     size_t   n_data;
-    uint8_t *data_syms = bytes_to_symbols_mc(data, data_len, bps, num_carriers, &n_data);
+    uint8_t *data_syms = bytes_to_symbols_mc(data, data_len, bps, num_carriers,
+                                             modulation == MOD_PSK, &n_data);
     free(data);
     if (!data_syms) {
         fprintf(stderr, "Error: allocation failed in bytes_to_symbols_mc.\n");
@@ -919,8 +988,9 @@ int main(int argc, char *argv[])
         return 1;
     }
     /* Alignment marker immediately after the all-zero preamble */
+    uint8_t marker_symbol = (modulation == MOD_FSK) ? (uint8_t)(M - 1) : (uint8_t)(M / 2);
     for (int c = 0; c < num_carriers; c++)
-        all_syms[PREAMBLE_SYMBOLS * (size_t)num_carriers + (size_t)c] = (uint8_t)(M / 2);
+        all_syms[PREAMBLE_SYMBOLS * (size_t)num_carriers + (size_t)c] = marker_symbol;
     memcpy(all_syms + ((size_t)PREAMBLE_SYMBOLS + 1) * (size_t)num_carriers,
            data_syms,
            n_data * (size_t)num_carriers);
@@ -953,6 +1023,7 @@ int main(int argc, char *argv[])
     cb.buffers_per_symbol = buffers_per_symbol;
     cb.num_carriers = num_carriers;
     cb.M = M;
+    cb.modulation = modulation;
 
     tx_ui_state_t ui_state;
     memset(&ui_state, 0, sizeof(ui_state));
@@ -970,8 +1041,13 @@ int main(int argc, char *argv[])
     for (int c = 0; c < num_carriers; c++) {
         int off = carrier_offset_index(c);
         int cyc = carrier_cycles + off * spacing_cycles;
-        cb.two_pi_fc_over_n[c] = 2.0f * (float)M_PI * (float)cyc / (float)FRAMES_PER_BUFFER;
+        int hz_c = carrier_hz + off * CARRIER_SPACING_HZ;
+        if (modulation == MOD_FSK)
+            cb.two_pi_fc_over_n[c] = TWO_PI * (float)hz_c / (float)SAMPLE_RATE;
+        else
+            cb.two_pi_fc_over_n[c] = 2.0f * (float)M_PI * (float)cyc / (float)FRAMES_PER_BUFFER;
     }
+    cb.two_pi_df_over_n = TWO_PI * (float)FSK_TONE_SPACING_HZ / (float)SAMPLE_RATE;
 
     pe = Pa_OpenDefaultStream(&stream,
                               0, 1,           /* no input, 1 output channel  */
@@ -1013,7 +1089,9 @@ int main(int argc, char *argv[])
     }
 
     SDL_Window *win = SDL_CreateWindow(
-        "M-PSK Transmitter — FFT + Sinusoid Controls",
+        modulation == MOD_FSK
+            ? "M-FSK Transmitter — FFT + Sinusoid Controls"
+            : "M-PSK Transmitter — FFT + Sinusoid Controls",
         SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
         UI_WIN_W, UI_WIN_H,
         SDL_WINDOW_SHOWN);

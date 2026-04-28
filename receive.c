@@ -50,7 +50,7 @@
  * Signal / demodulation constants
  * ═══════════════════════════════════════════════════════════════════ */
 #define SAMPLE_RATE              48000
-#define FRAMES_PER_BUFFER        0x1000          /* 4096 samples/callback  */
+#define FRAMES_PER_BUFFER        1024          /* 4096 samples/callback  */
 
 /* Carrier bin mapping
  *   transmitter cycles/buffer = c (for 256-sample TX buffer)
@@ -63,12 +63,21 @@
 #define DEFAULT_NUM_CARRIERS      1
 #define MAX_NUM_CARRIERS         32
 #define CARRIER_SPACING_HZ      375
+#define FSK_TONE_SPACING_HZ     125
+#define MAX_MOD_ORDER            64
+
+typedef enum {
+    MOD_PSK = 0,
+    MOD_FSK = 1
+} modulation_t;
 
 static int   g_carrier_bin = DEFAULT_CARRIER_CYCLES * CARRIER_BIN_PER_CYCLE;
 static float g_carrier_hz  = 750.0f;
 static int   g_carrier_bins[MAX_NUM_CARRIERS];
 static float g_carrier_hzs[MAX_NUM_CARRIERS];
 static int   g_num_carriers = 1;
+static int   g_fsk_bins[MAX_MOD_ORDER];
+static float g_fsk_hzs[MAX_MOD_ORDER];
 
 /* Carrier DFT magnitude for a full-scale sine wave ≈ FRAMES_PER_BUFFER/2.
  * SIG_THRESHOLD is a low absolute floor (≈ 1% of full scale) so that
@@ -171,6 +180,7 @@ static volatile int    s_new_data = 0;
  *   Inner product with audio gives DFT[CARRIER_BIN].
  * ═══════════════════════════════════════════════════════════════════ */
 static float complex exptable[MAX_NUM_CARRIERS][FRAMES_PER_BUFFER];
+static float complex fsk_exptable[MAX_MOD_ORDER][FRAMES_PER_BUFFER];
 
 /* ═══════════════════════════════════════════════════════════════════
  * Circular audio buffer for symbol-aligned window extraction
@@ -236,8 +246,7 @@ static int parse_buffers_per_symbol(const char *s, int *out_bpsym)
     char *ep;
     long v = strtol(s, &ep, 10);
     if (*ep != '\0') return 0;
-    if (v < MIN_BUFFERS_PER_SYMBOL) return 0;
-    if ((v % 16) != 0) return 0;
+    if (v < 1) return 0;
     *out_bpsym = (int)v;
     return 1;
 }
@@ -250,6 +259,24 @@ static int parse_num_carriers(const char *s, int *out_n)
     if (v < 1 || v > MAX_NUM_CARRIERS) return 0;
     *out_n = (int)v;
     return 1;
+}
+
+static int parse_modulation(const char *s, modulation_t *out)
+{
+    if (strcmp(s, "psk") == 0) {
+        *out = MOD_PSK;
+        return 1;
+    }
+    if (strcmp(s, "fsk") == 0) {
+        *out = MOD_FSK;
+        return 1;
+    }
+    return 0;
+}
+
+static const char *modulation_name(modulation_t mod)
+{
+    return (mod == MOD_FSK) ? "FSK" : "PSK";
 }
 
 static int carrier_offset_index(int idx)
@@ -354,6 +381,24 @@ static void estimate_mpsk_error_prob(int M, float snr_db,
         ser = 2.0f * qfunc(arg);
         if (ser > 1.0f) ser = 1.0f;
     }
+
+    int bps = ilog2(M);
+    float ber = (bps > 0) ? (ser / (float)bps) : ser;
+    if (ber > 1.0f) ber = 1.0f;
+
+    *out_ser = ser;
+    *out_ber = ber;
+}
+
+static void estimate_mfsk_error_prob(int M, float snr_db,
+                                     float *out_ser, float *out_ber)
+{
+    float gamma_s = powf(10.0f, snr_db / 10.0f);
+    if (gamma_s < 1e-9f) gamma_s = 1e-9f;
+
+    float p = qfunc(sqrtf(2.0f * gamma_s));
+    float ser = (float)(M - 1) * p;
+    if (ser > 1.0f) ser = 1.0f;
 
     int bps = ilog2(M);
     float ber = (bps > 0) ? (ser / (float)bps) : ser;
@@ -659,6 +704,7 @@ static void render_iq_panel(SDL_Renderer *ren, TTF_Font *font,
             draw_text(ren, font, lbl, tx, ty, lc);
         }
     }
+
 
     /* ── history dots with quadratic alpha fade ─────────────────────── */
     if (count > 0) {
@@ -993,7 +1039,8 @@ static void render_frame(SDL_Renderer *ren, TTF_Font *font,
                           const float *magnitudes, float *peaks,
                           float carrier_mag, float carrier_phase_deg,
                           int current_sym, int current_bits,
-                          int rx_state, int M, float live_rate_bps,
+                          int rx_state, int M, modulation_t modulation,
+                          float fsk_tone_hz, float live_rate_bps,
                           float err_snr_db,
                           int empirical_available, float empirical_corr_rate,
                           int sym_windows_cfg, int decode_window_idx,
@@ -1030,10 +1077,11 @@ static void render_frame(SDL_Renderer *ren, TTF_Font *font,
         snprintf(title, sizeof(title),
                  "FFT Spectrum  —  %.0f..%.0f Hz   |   "
                  "Carrier: bin %d  (~%.0f Hz)   |   "
-                 "%d-PSK  (%d bit%s/symbol)  |  %d carrier%s",
+                 "%d-%s  (%d bit%s/symbol)  |  %d carrier%s",
                  FFT_DISPLAY_MIN_HZ, FFT_DISPLAY_MAX_HZ,
                  g_carrier_bin, g_carrier_hz,
-                 M, ilog2(M), ilog2(M) == 1 ? "" : "s",
+                 M, modulation_name(modulation),
+                 ilog2(M), ilog2(M) == 1 ? "" : "s",
                  g_num_carriers, g_num_carriers == 1 ? "" : "s");
         SDL_Color c = {175, 175, 210, 255};
         draw_text(ren, font, title, CHART_X, 18, c);
@@ -1216,6 +1264,10 @@ static void render_frame(SDL_Renderer *ren, TTF_Font *font,
                 snprintf(buf, sizeof(buf), "%s",
                          rx_state == 0 ? "Waiting for carrier…"
                                        : "Calibrating…");
+            } else if (modulation == MOD_FSK) {
+                snprintf(buf, sizeof(buf),
+                         "Tone: %d   Bits: %s   (%.0f Hz)",
+                         current_sym, bits_str, fsk_tone_hz);
             } else {
                 snprintf(buf, sizeof(buf),
                          "Symbol: %d   Bits: %s", current_sym, bits_str);
@@ -1363,7 +1415,10 @@ static void render_frame(SDL_Renderer *ren, TTF_Font *font,
             const float alpha = 0.12f; /* rolling-average weight */
             if (rx_state == 2) {
                 float ser_now = 1.0f, ber_now = 0.5f;
-                estimate_mpsk_error_prob(M, err_snr_db, &ser_now, &ber_now);
+                if (modulation == MOD_FSK)
+                    estimate_mfsk_error_prob(M, err_snr_db, &ser_now, &ber_now);
+                else
+                    estimate_mpsk_error_prob(M, err_snr_db, &ser_now, &ber_now);
 
                 if (!pe_init) {
                     ser_avg = ser_now;
@@ -1646,6 +1701,7 @@ int main(int argc, char *argv[])
 {
     /* ── argument parsing ─────────────────────────────────────────── */
     int            M            = 4;   /* default: QPSK */
+    modulation_t   modulation   = MOD_PSK;
     int            fec_enabled  = 0;
     int            fec_depth    = PSK_DEFAULT_ILVE_DEPTH;
     int            carrier_hz   = DEFAULT_CARRIER_CYCLES * SAMPLE_RATE / 256;
@@ -1710,6 +1766,18 @@ int main(int argc, char *argv[])
                 return 1;
             }
 
+        } else if (strcmp(argv[a], "-t") == 0) {
+            if (a + 1 >= argc) {
+                fprintf(stderr, "Error: -t requires an argument (psk|fsk).\n");
+                return 1;
+            }
+            if (!parse_modulation(argv[++a], &modulation)) {
+                fprintf(stderr,
+                        "Error: invalid modulation '%s' (must be 'psk' or 'fsk').\n",
+                        argv[a]);
+                return 1;
+            }
+
         } else if (strcmp(argv[a], "-c") == 0) {
             if (a + 1 >= argc) {
                 fprintf(stderr, "Error: -c requires carrier frequency in Hz.\n");
@@ -1739,10 +1807,10 @@ int main(int argc, char *argv[])
             }
             if (!parse_buffers_per_symbol(argv[++a], &buffers_per_symbol)) {
                 fprintf(stderr,
-                        "Error: invalid -s value '%s' (must be integer >= %d and divisible by 16).\n",
-                        argv[a], 32);
+                        "Error: invalid -s value '%s' (must be integer >= 1).\n",
+                        argv[a]);
                 fprintf(stderr,
-                        "       Example values: 32, 48, 64.\n");
+                        "       Example values: 4, 8, 16, 32.\n");
                 return 1;
             }
 
@@ -1780,19 +1848,34 @@ int main(int argc, char *argv[])
 
         } else {
             fprintf(stderr, "Unknown argument: %s\n"
-                    "Usage: %s [-m M] [-c FREQ_HZ] [-s BUFS] [-k CARRIERS] [-e] [-d DEPTH] [-o OUTPUT_FILE]\n"
+                    "Usage: %s [-t psk|fsk] [-m M] [-c FREQ_HZ] [-s BUFS] [-k CARRIERS] [-e] [-d DEPTH] [-o OUTPUT_FILE]\n"
                     "          [--device <idx>] [-n <substr>] [--list-devices]\n"
+                    "  -t MODE   modulation mode: psk (default) or fsk\n"
                     "  -c HZ     carrier frequency in Hz (integer, < %d)\n"
-                    "  -s N      TX buffers/symbol (>= %d, divisible by 16)\n"
+                    "  -s N      TX buffers/symbol (>= 1)\n"
                     "  -k N      number of parallel carriers (1..%d, spacing %d Hz)\n"
                     "  -o FILE   write decoded bytes to FILE when carrier drops\n",
-                    argv[a], argv[0], MAX_CARRIER_HZ, MIN_BUFFERS_PER_SYMBOL,
+                    argv[a], argv[0], MAX_CARRIER_HZ,
                     MAX_NUM_CARRIERS, CARRIER_SPACING_HZ);
             return 1;
         }
     }
 
-    if (((long)carrier_hz * 256) % SAMPLE_RATE != 0) {
+    if (modulation == MOD_FSK) {
+        if (num_carriers != 1) {
+            fprintf(stderr,
+                    "Error: FSK receiver currently supports exactly one carrier (omit -k or use -k 1).\n");
+            return 1;
+        }
+        if (M > MAX_MOD_ORDER) {
+            fprintf(stderr,
+                    "Error: FSK order M=%d exceeds supported maximum %d.\n",
+                    M, MAX_MOD_ORDER);
+            return 1;
+        }
+    }
+
+    if (modulation != MOD_FSK && ((long)carrier_hz * 256) % SAMPLE_RATE != 0) {
         int nearest = nearest_compatible_hz(carrier_hz);
         fprintf(stderr,
                 "Error: carrier %d Hz is incompatible with %d Hz sample rate and 256-sample TX buffers.\n",
@@ -1820,10 +1903,20 @@ int main(int argc, char *argv[])
             print_base_range_hint(num_carriers);
             return 1;
         }
-        if (((long)hz_c * 256) % SAMPLE_RATE != 0) {
+        if (modulation != MOD_FSK && ((long)hz_c * 256) % SAMPLE_RATE != 0) {
             fprintf(stderr,
                     "Error: derived carrier %d Hz is incompatible with sample timing.\n",
                     hz_c);
+            return 1;
+        }
+    }
+
+    if (modulation == MOD_FSK) {
+        int max_tone_hz = carrier_hz + (M - 1) * FSK_TONE_SPACING_HZ;
+        if (max_tone_hz >= MAX_CARRIER_HZ) {
+            fprintf(stderr,
+                    "Error: FSK tones exceed limit with -m %d and -c %d Hz (highest tone %d Hz, limit %d Hz).\n",
+                    M, carrier_hz, max_tone_hz, MAX_CARRIER_HZ - 1);
             return 1;
         }
     }
@@ -1835,9 +1928,26 @@ int main(int argc, char *argv[])
     for (int c = 0; c < num_carriers; c++) {
         int off = carrier_offset_index(c);
         int cyc = carrier_cycles + off * spacing_cycles;
-        g_carrier_bins[c] = cyc * CARRIER_BIN_PER_CYCLE;
-        g_carrier_hzs[c]  = (float)cyc * SAMPLE_RATE / 256.0f;
+        int hz_c = carrier_hz + off * CARRIER_SPACING_HZ;
+        if (modulation == MOD_FSK) {
+            g_carrier_hzs[c] = (float)hz_c;
+            g_carrier_bins[c] = (int)lroundf((float)hz_c * (float)FRAMES_PER_BUFFER
+                                             / (float)SAMPLE_RATE);
+        } else {
+            g_carrier_bins[c] = cyc * CARRIER_BIN_PER_CYCLE;
+            g_carrier_hzs[c]  = (float)cyc * SAMPLE_RATE / 256.0f;
+        }
     }
+
+    if (modulation == MOD_FSK) {
+        for (int k = 0; k < M; k++) {
+            int tone_hz = carrier_hz + k * FSK_TONE_SPACING_HZ;
+            g_fsk_bins[k] = (int)lroundf((float)tone_hz * (float)FRAMES_PER_BUFFER
+                                         / (float)SAMPLE_RATE);
+            g_fsk_hzs[k] = (float)tone_hz;
+        }
+    }
+
     g_carrier_bin = g_carrier_bins[0];
     g_carrier_hz  = g_carrier_hzs[0];
 
@@ -1850,9 +1960,19 @@ int main(int argc, char *argv[])
         }
     }
 
+    if (modulation == MOD_FSK) {
+        for (int k = 0; k < M; k++) {
+            for (size_t i = 0; i < FRAMES_PER_BUFFER; i++) {
+                fsk_exptable[k][i] = cexpf(-I * 2.0f * (float)M_PI
+                                           * g_fsk_hzs[k] / (float)SAMPLE_RATE
+                                           * (float)i);
+            }
+        }
+    }
+
     fprintf(stderr,
-            "%d-PSK receiver — %d carrier%s, primary bin %d (~%.0f Hz), %d bit%s/symbol each, %d win/sym\n",
-            M, num_carriers, num_carriers == 1 ? "" : "s",
+            "%d-%s receiver — %d carrier%s, primary bin %d (~%.0f Hz), %d bit%s/symbol each, %d win/sym\n",
+            M, modulation_name(modulation), num_carriers, num_carriers == 1 ? "" : "s",
             g_carrier_bin, g_carrier_hz,
             ilog2(M), ilog2(M) == 1 ? "" : "s", sym_windows_cfg);
 
@@ -1868,7 +1988,9 @@ int main(int argc, char *argv[])
     }
 
     SDL_Window *win = SDL_CreateWindow(
-        "M-PSK Receiver — FFT + IQ Constellation",
+        modulation == MOD_FSK
+            ? "M-FSK Receiver — FFT"
+            : "M-PSK Receiver — FFT + IQ Constellation",
         SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
         WIN_W, WIN_H,
         SDL_WINDOW_SHOWN | SDL_WINDOW_RESIZABLE);
@@ -2073,6 +2195,8 @@ int main(int argc, char *argv[])
         float ref_mag      = 1.0f;    /* calibrated reference magnitude        */
         int   current_sym  = 0;
         int   current_bits = 0;
+        int   prev_fsk_sym = -1;
+        float current_tone_hz = g_carrier_hz;
         int   current_sym_c[MAX_NUM_CARRIERS] = {0};
 
         /* ── Timing recovery state ──────────────────────────────────
@@ -2134,15 +2258,18 @@ int main(int argc, char *argv[])
 
         /* Initial blank frame */
         render_frame(ren, font, display_magnitudes, peaks,
-                     0.0f, 0.0f, 0, 0, rx_state, M, 0.0f, err_snr_db,
+                     0.0f, 0.0f, 0, 0, rx_state, M, modulation, current_tone_hz,
+                     0.0f, err_snr_db,
                      0, 0.0f,
                      sym_windows_cfg, decode_window_idx,
                      sym_window, is_boundary, timing_locked, pll_error_deg,
                      snr_db, interference, intf_bin,
                      fec_enabled, fec_corrections, fec_depth);
-        render_iq_panels(ren, font, iq_hist, iq_head, iq_count,
-                         M, current_sym_c, rx_state,
-                         timing_locked, sym_window, num_carriers);
+        if (modulation == MOD_PSK) {
+            render_iq_panels(ren, font, iq_hist, iq_head, iq_count,
+                             M, current_sym_c, rx_state,
+                             timing_locked, sym_window, num_carriers);
+        }
         render_decoded_output(ren, font,
                                preview_buf, preview_chars,
                                preview_bytes, preview_corr,
@@ -2195,8 +2322,52 @@ int main(int argc, char *argv[])
 
 
 
+            /* ── derived carrier quantities ─────────────────────── */
+            float received_phase    = atan2f(local_ft_im[0], local_ft_re[0]);
+            float carrier_phase_deg = received_phase * 180.0f / (float)M_PI;
+            int fsk_candidate_sym = 0;
+            float fsk_candidate_hz = g_carrier_hz;
+
+            if (modulation == MOD_FSK) {
+                float best_mag = -1.0f;
+                for (int k = 0; k < M; k++) {
+                    float complex ft_tone = 0.0f;
+                    for (size_t i = 0; i < FRAMES_PER_BUFFER; i++)
+                        ft_tone += local_samples[i] * fsk_exptable[k][i];
+                    float mag_tone = cabsf(ft_tone);
+                    if (mag_tone > best_mag) {
+                        best_mag = mag_tone;
+                        fsk_candidate_sym = k;
+                        fsk_candidate_hz = g_fsk_hzs[k];
+                        local_ft_re[0] = crealf(ft_tone);
+                        local_ft_im[0] = cimagf(ft_tone);
+                        carrier_mag_c[0] = mag_tone;
+                    }
+                }
+                carrier_mag = carrier_mag_c[0];
+                received_phase = atan2f(local_ft_im[0], local_ft_re[0]);
+                carrier_phase_deg = received_phase * 180.0f / (float)M_PI;
+            }
+
             /* ── channel quality estimates ──────────────────────── */
-            if (g_carrier_bin >= 0 && g_carrier_bin < ANALYSIS_BINS) {
+            if (modulation == MOD_FSK) {
+                int active_bin = g_fsk_bins[fsk_candidate_sym];
+                if (active_bin >= 0 && active_bin < ANALYSIS_BINS) {
+                    snr_db = psk_snr_estimate_db(analysis_magnitudes, ANALYSIS_BINS,
+                                                 active_bin);
+                    interference = psk_detect_interference(analysis_magnitudes, ANALYSIS_BINS,
+                                                           active_bin, &intf_bin);
+                    err_snr_db = estimate_system_snr_db(analysis_magnitudes,
+                                                        ANALYSIS_BINS,
+                                                        &active_bin,
+                                                        1);
+                } else {
+                    snr_db = -60.0f;
+                    interference = 0;
+                    intf_bin = 0;
+                    err_snr_db = -60.0f;
+                }
+            } else if (g_carrier_bin >= 0 && g_carrier_bin < ANALYSIS_BINS) {
                 snr_db = psk_snr_estimate_db(analysis_magnitudes, ANALYSIS_BINS,
                                              g_carrier_bin);
                 interference = psk_detect_interference(analysis_magnitudes, ANALYSIS_BINS,
@@ -2211,10 +2382,6 @@ int main(int argc, char *argv[])
                 intf_bin = 0;
                 err_snr_db = -60.0f;
             }
-
-            /* ── derived carrier quantities ─────────────────────── */
-            float received_phase    = atan2f(local_ft_im[0], local_ft_re[0]);
-            float carrier_phase_deg = received_phase * 180.0f / (float)M_PI;
 
             /* ── Symbol-aligned window extraction ───────────────────
              *
@@ -2254,6 +2421,25 @@ int main(int argc, char *argv[])
                         local_ft_im[c] = cimagf(ft_aligned);
                         carrier_mag_c[c] = cabsf(ft_aligned);
                     }
+
+                    if (modulation == MOD_FSK) {
+                        float best_mag = -1.0f;
+                        for (int k = 0; k < M; k++) {
+                            float complex ft_tone = 0.0f;
+                            for (size_t i = 0; i < FRAMES_PER_BUFFER; i++)
+                                ft_tone += aligned_window[i] * fsk_exptable[k][i];
+                            float mag_tone = cabsf(ft_tone);
+                            if (mag_tone > best_mag) {
+                                best_mag = mag_tone;
+                                fsk_candidate_sym = k;
+                                fsk_candidate_hz = g_fsk_hzs[k];
+                                local_ft_re[0] = crealf(ft_tone);
+                                local_ft_im[0] = cimagf(ft_tone);
+                                carrier_mag_c[0] = mag_tone;
+                            }
+                        }
+                    }
+
                     carrier_mag = carrier_mag_c[0];
                     received_phase = atan2f(local_ft_im[0], local_ft_re[0]);
                     carrier_phase_deg = received_phase * 180.0f / (float)M_PI;
@@ -2298,8 +2484,55 @@ int main(int argc, char *argv[])
                  * (PSK_SIG_THRESHOLD) to be a valid phase reference; we
                  * cannot check its SNR retrospectively. */
 
-                if ((snr_db >= CARRIER_SNR_MIN_DB || carrier_mag > SIG_THRESHOLD) &&
-                    cabsf(ft_prev) > 0.5f) {
+                if (modulation == MOD_FSK) {
+                    if (timing_locked) {
+                        sym_window = (sym_window + 1) % sym_windows_cfg;
+                        if (sym_window == 0) {
+                            is_boundary = 1;
+                            if (sym_windows_cfg > 2) {
+                                pthread_mutex_lock(&slide_mutex);
+                                last_boundary_sample = slide_sample_count - FRAMES_PER_BUFFER;
+                                pthread_mutex_unlock(&slide_mutex);
+                            }
+                        } else {
+                            is_boundary = 0;
+                        }
+                    } else if ((snr_db >= CARRIER_SNR_MIN_DB || carrier_mag > SIG_THRESHOLD) &&
+                               prev_fsk_sym >= 0) {
+                        if (fsk_candidate_sym != prev_fsk_sym) {
+                            is_boundary = 1;
+                            sym_window = 0;
+
+                            if (sym_windows_cfg > 2) {
+                                pthread_mutex_lock(&slide_mutex);
+                                last_boundary_sample = slide_sample_count - FRAMES_PER_BUFFER;
+                                pthread_mutex_unlock(&slide_mutex);
+                                use_aligned_windows = 1;
+                            } else {
+                                use_aligned_windows = 0;
+                            }
+                            timing_locked = 1;
+                        } else {
+                            is_boundary = 0;
+                        }
+                    } else {
+                        is_boundary = 0;
+                    }
+                    prev_fsk_sym = fsk_candidate_sym;
+                } else if (timing_locked) {
+                    sym_window = (sym_window + 1) % sym_windows_cfg;
+                    if (sym_window == 0) {
+                        is_boundary = 1;
+                        if (use_aligned_windows) {
+                            pthread_mutex_lock(&slide_mutex);
+                            last_boundary_sample = slide_sample_count - FRAMES_PER_BUFFER;
+                            pthread_mutex_unlock(&slide_mutex);
+                        }
+                    } else {
+                        is_boundary = 0;
+                    }
+                } else if ((snr_db >= CARRIER_SNR_MIN_DB || carrier_mag > SIG_THRESHOLD) &&
+                           cabsf(ft_prev) > 0.5f) {
 
                     float complex delta = ft_curr * conjf(ft_prev);
                     float dp = atan2f(cimagf(delta), crealf(delta));
@@ -2313,11 +2546,12 @@ int main(int argc, char *argv[])
                         /* Update boundary position for aligned window extraction
                          * This happens on EVERY boundary so we track the current symbol */
                         pthread_mutex_lock(&slide_mutex);
-                        last_boundary_sample = slide_sample_count - FRAMES_PER_BUFFER;
+                        if (use_aligned_windows)
+                            last_boundary_sample = slide_sample_count - FRAMES_PER_BUFFER;
                         pthread_mutex_unlock(&slide_mutex);
 
                         if (!timing_locked) {
-                            use_aligned_windows = 1;
+                            use_aligned_windows = (sym_windows_cfg > 2);
                         }
                         timing_locked = 1;
                     } else {
@@ -2450,7 +2684,10 @@ int main(int argc, char *argv[])
                     is_boundary = 0;
                 }
 
-                if (rx_state == 1) {
+                if (modulation == MOD_FSK) {
+                    rx_state = 2;
+                    ref_mag = carrier_mag > 1.0f ? carrier_mag : 1.0f;
+                } else if (rx_state == 1) {
                     /* Accumulate received phases via circular mean.
                      * We do NOT skip boundary windows here: the
                      * preamble phase is constant (0°) so even a
@@ -2468,7 +2705,15 @@ int main(int argc, char *argv[])
                     }
                 }
 
-                if (rx_state == 2) {
+                if (rx_state == 2 && modulation == MOD_FSK) {
+                    if (!is_boundary) {
+                        current_sym = fsk_candidate_sym;
+                        current_bits = fsk_candidate_sym;
+                        current_tone_hz = fsk_candidate_hz;
+                        current_sym_c[0] = fsk_candidate_sym;
+                        current_bits_c[0] = fsk_candidate_sym;
+                    }
+                } else if (rx_state == 2) {
                     /* Correct for phase offset and map to [0, 2π) */
                     float corrected = received_phase - phase_offset;
                     corrected = fmodf(corrected + 4.0f * (float)M_PI,
@@ -2518,7 +2763,7 @@ int main(int argc, char *argv[])
                  * Both boundary and safe points are stored so the
                  * inter-symbol smear is visible in the constellation;
                  * boundary points are flagged for different colouring. */
-                {
+                if (modulation == MOD_PSK) {
                     for (int c = 0; c < num_carriers; c++) {
                         float phase_c = atan2f(local_ft_im[c], local_ft_re[c]);
                         float store_phase = (rx_state == 2)
@@ -2550,6 +2795,7 @@ int main(int argc, char *argv[])
                     sym_window = -1;
                 }
                 is_boundary = 0;
+                prev_fsk_sym = -1;
             }
 
             /* ── Symbol accumulator ───────────────────────────────────
@@ -2696,7 +2942,7 @@ int main(int argc, char *argv[])
              * WAITING (0) to CALIBRATING (1), i.e. a new carrier appears
              * and a fresh transmission is starting.
              */
-            if (prev_rx_state == 0 && rx_state == 1) {
+            if (prev_rx_state == 0 && rx_state != 0) {
                 /* New transmission: reset preview */
                 preview_chars   = 0;
                 preview_bytes   = 0;
@@ -2746,12 +2992,43 @@ int main(int argc, char *argv[])
 
                 /* Convert bytes to display characters */
                 if (src && src_len > 0) {
+                    const int preview_budget = PREVIEW_MAX - 2;
+                    size_t start_bi = 0;
+                    int accum = 0;
+
+                    /* Keep a tail window of source bytes whose rendered form
+                     * fits PREVIEW_MAX, so new decoded content continues to
+                     * appear during long transmissions. */
+                    for (size_t bi = src_len; bi > 0; bi--) {
+                        unsigned char b = src[bi - 1];
+                        int cost;
+                        if (b >= 0x20 && b < 0x7F) cost = 1;
+                        else if (b == '\n' || b == '\r') cost = 1;
+                        else if (b == '\t') cost = 4;
+                        else cost = 2;
+
+                        if (accum + cost > preview_budget) {
+                            start_bi = bi;
+                            break;
+                        }
+                        accum += cost;
+                    }
+
                     preview_chars = 0;
                     preview_bytes = (int)src_len;
                     memset(preview_buf, 0, sizeof(preview_buf));
 
-                    for (size_t bi = 0;
-                         bi < src_len && preview_chars < PREVIEW_MAX - 2;
+                    if (start_bi > 0) {
+                        const char *prefix = "... ";
+                        size_t plen = strlen(prefix);
+                        if ((size_t)preview_chars + plen < sizeof(preview_buf)) {
+                            memcpy(preview_buf + preview_chars, prefix, plen);
+                            preview_chars += (int)plen;
+                        }
+                    }
+
+                    for (size_t bi = start_bi;
+                         bi < src_len && preview_chars < preview_budget;
                          bi++) {
                         unsigned char b = src[bi];
                         if (b >= 0x20 && b < 0x7F) {
@@ -2762,7 +3039,7 @@ int main(int argc, char *argv[])
                         } else if (b == '\t') {
                             /* Expand tab to four spaces */
                             for (int sp = 0;
-                                 sp < 4 && preview_chars < PREVIEW_MAX - 2;
+                                 sp < 4 && preview_chars < preview_budget;
                                  sp++)
                                 preview_buf[preview_chars++] = ' ';
                         } else {
@@ -2785,18 +3062,21 @@ int main(int argc, char *argv[])
 
             render_frame(ren, font, display_magnitudes, peaks,
                          carrier_mag, carrier_phase_deg,
-                         current_sym, current_bits, rx_state, M, live_rate_bps,
+                         current_sym, current_bits, rx_state, M,
+                         modulation, current_tone_hz, live_rate_bps,
                          err_snr_db,
-                         empirical_available, empirical_corr_rate,
+                         empirical_available,
+                         empirical_corr_rate,
                          sym_windows_cfg, decode_window_idx,
-                         sym_window, is_boundary, timing_locked,
-                         pll_error_deg,
+                         sym_window, is_boundary, timing_locked, pll_error_deg,
                          snr_db, interference, intf_bin,
                          fec_enabled, fec_corrections, fec_depth);
 
-            render_iq_panels(ren, font, iq_hist, iq_head, iq_count,
-                             M, current_sym_c, rx_state,
-                             timing_locked, sym_window, num_carriers);
+            if (modulation == MOD_PSK) {
+                render_iq_panels(ren, font, iq_hist, iq_head, iq_count,
+                                 M, current_sym_c, rx_state,
+                                 timing_locked, sym_window, num_carriers);
+            }
 
             render_decoded_output(ren, font,
                                    preview_buf, preview_chars,

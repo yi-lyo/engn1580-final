@@ -192,10 +192,11 @@ declare -a CASE_NAMES
 declare -a CASE_RESULTS
 declare -a CASE_ACCURACY
 
-run_case "default_qpsk" "-m 4 -c 750" "-m 4 -c 750"
-run_case "faster_symbol_qpsk" "-m 4 -c 750 -s 48" "-m 4 -c 750 -s 48"
-run_case "higher_carrier_8psk" "-m 8 -c 1125" "-m 8 -c 1125"
-run_case "fec_16psk" "-m 16 -c 1500 -e -d 32" "-m 16 -c 1500 -e -d 32"
+run_case "default_qpsk" "-t psk -m 4 -c 750" "-t psk -m 4 -c 750"
+run_case "faster_symbol_qpsk" "-t psk -m 4 -c 750 -s 48" "-t psk -m 4 -c 750 -s 48"
+run_case "higher_carrier_8psk" "-t psk -m 8 -c 1125" "-t psk -m 8 -c 1125"
+run_case "fec_16psk" "-t psk -m 16 -c 1500 -e -d 32" "-t psk -m 16 -c 1500 -e -d 32"
+run_case "fsk_8ary" "-t fsk -m 8 -c 750" "-t fsk -m 8 -c 750"
 
 echo "===================================="
 echo "Orchestration Summary"

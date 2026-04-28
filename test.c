@@ -52,6 +52,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
+#include <sys/wait.h>
 
 /* ─────────────────────────────────────────────────────────────────
  * Terminal colour codes (disabled automatically on non-Unix)
@@ -109,6 +111,92 @@ static void t_observe(const char *msg)
 static void section(const char *name)
 {
     printf("\n" C_YELLOW "━━━  %s  ━━━" C_RESET "\n", name);
+}
+
+static int run_cmd_capture(const char *cmd, const char *out_path)
+{
+    char full[1024];
+    snprintf(full, sizeof(full), "%s > \"%s\" 2>&1", cmd, out_path);
+    int rc = system(full);
+    if (rc == -1) return -1;
+    if (WIFEXITED(rc)) return WEXITSTATUS(rc);
+    return 128;
+}
+
+static int file_contains_text(const char *path, const char *needle)
+{
+    FILE *fp = fopen(path, "rb");
+    if (!fp) return 0;
+
+    fseek(fp, 0, SEEK_END);
+    long n = ftell(fp);
+    if (n < 0) {
+        fclose(fp);
+        return 0;
+    }
+    rewind(fp);
+
+    char *buf = malloc((size_t)n + 1);
+    if (!buf) {
+        fclose(fp);
+        return 0;
+    }
+
+    size_t r = fread(buf, 1, (size_t)n, fp);
+    fclose(fp);
+    buf[r] = '\0';
+
+    int found = (strstr(buf, needle) != NULL);
+    free(buf);
+    return found;
+}
+
+static void test_fsk_cli(void)
+{
+    section("FSK CLI: parser and bounds");
+
+    if (access("./transmit", X_OK) != 0 || access("./receive", X_OK) != 0) {
+        t_observe("Skipping FSK CLI tests: ./transmit or ./receive not built in CWD");
+        return;
+    }
+
+    const char *tx_log = "/tmp/psk_test_tx_cli.log";
+    const char *rx_log = "/tmp/psk_test_rx_cli.log";
+
+    int rc;
+
+    rc = run_cmd_capture("./transmit -t fsk -m 64 -s 4 -c 99999 -i ./input.txt", tx_log);
+    ASSERT(rc != 0, "transmit FSK: invalid carrier is rejected (sanity gate)");
+    ASSERT(!file_contains_text(tx_log, "invalid -s value"),
+           "transmit FSK: -s 4 accepted by parser (no legacy >=32 rejection)");
+    ASSERT(file_contains_text(tx_log, "invalid carrier frequency"),
+           "transmit FSK: error path reaches carrier validation after -s parse");
+
+    rc = run_cmd_capture("./receive -t fsk -m 64 -s 4 -c 99999 -o /tmp/psk_cli_out.bin", rx_log);
+    ASSERT(rc != 0, "receive FSK: invalid carrier is rejected (sanity gate)");
+    ASSERT(!file_contains_text(rx_log, "invalid -s value"),
+           "receive FSK: -s 4 accepted by parser (no legacy >=32 rejection)");
+    ASSERT(file_contains_text(rx_log, "invalid carrier frequency"),
+           "receive FSK: error path reaches carrier validation after -s parse");
+
+    rc = run_cmd_capture("./transmit -t fsk -m 256 -s 8 -c 99999 -i ./input.txt", tx_log);
+    ASSERT(rc != 0, "transmit FSK: command with m=256 parses and reaches validation");
+    ASSERT(!file_contains_text(tx_log, "invalid -m value"),
+           "transmit FSK: m=256 accepted as valid modulation order");
+
+    rc = run_cmd_capture("./transmit -t fsk -m 64 -s 8 -c 750 -k 64 -i ./input.txt", tx_log);
+    ASSERT(rc != 0, "transmit FSK: -k 64 rejected (above max carriers)");
+    ASSERT(file_contains_text(tx_log, "invalid -k value '64'"),
+           "transmit FSK: carrier-count bound error message is present");
+
+    rc = run_cmd_capture("./receive -t fsk -m 64 -s 8 -c 750 -k 64 -o /tmp/psk_cli_out.bin", rx_log);
+    ASSERT(rc != 0, "receive FSK: -k 64 rejected (above max carriers)");
+    ASSERT(file_contains_text(rx_log, "invalid -k value '64'"),
+           "receive FSK: carrier-count bound error message is present");
+
+    remove(tx_log);
+    remove(rx_log);
+    remove("/tmp/psk_cli_out.bin");
 }
 
 /* ═════════════════════════════════════════════════════════════════
@@ -1779,6 +1867,7 @@ int main(void)
     test_fec();
     test_loopback();
     test_file_io();
+    test_fsk_cli();
 
     printf("\n");
     printf("══════════════════════════════════════════════\n");
