@@ -65,7 +65,7 @@
 #define CARRIER_SPACING_HZ     375
 #define FSK_TONE_SPACING_HZ    125
 #define MAX_CARRIER_HZ       20000
-#define PREAMBLE_SYMBOLS     20       /* phase-0° symbols sent before data       */
+#define PREAMBLE_SYMBOLS     100000       /* phase-0° symbols sent before data       */
 
 #define UI_WIN_W 1100
 #define UI_WIN_H 680
