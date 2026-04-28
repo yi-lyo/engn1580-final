@@ -64,7 +64,7 @@
 #define MAX_NUM_CARRIERS         32
 #define CARRIER_SPACING_HZ      375
 #define FSK_TONE_SPACING_HZ     125
-#define MAX_MOD_ORDER            64
+#define MAX_MOD_ORDER            256
 
 typedef enum {
     MOD_PSK = 0,
