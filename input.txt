@@ -1,0 +1,1308 @@
+IEEE TRANSACTIONS ON WIRELESS COMMUNICATIONS, VOL. 1, NO. 3, JULY 2002 415
+Wireless Systems and Interference Avoidance
+Christopher Rose, Member, IEEE, Sennur Ulukus, Member, IEEE, and Roy D. Yates, Member, IEEE
+Abstract—Motivated by the emergence of programmable
+radios, we seek to understand a new class of communication
+system where pairs of transmitters and receivers can adapt their
+modulation/demodulation method in the presence of interference
+to achieve better performance. Using signal to interference ratio
+as a metric and a general signal space approach, we present a
+class of iterative distributed algorithms for synchronous systems
+which results in an ensemble of optimal waveforms for multiple
+users connected to a common receiver (or colocated independent
+receivers). That is, the waveform ensemble meets the Welch Bound
+with equality and, therefore, achieves minimum average interfer-
+ence over the ensemble of signature waveforms. We derive fixed
+points for a number of scenarios, provide examples, look briefly
+at ensemble stability under user addition and deletion as well
+as provide a simplistic comparison to synchronous code-division
+multiple-access. We close with suggestions for future work.
+Index Terms—Adaptive modulation, code-division multiple-ac-
+cess systems, codeword optimization, interference avoidance, mul-
+tiuser detection, sum capacity, vector channels.
+I. INTRODUCTION
+WIRELESS SYSTEM designers have always had to
+contend with interference from both natural sources
+and other users of the medium. Thus, the classical wireless
+communications design cycle has consisted of measuring
+or predicting channel impairments, choosing a modulation
+method, signal preconditioning at the transmitter, and pro-
+cessing at the receiver to reliably reconstruct the transmitted
+information. These methods have evolved from simple (like
+FM and preemphasis) to relatively complex (like code-division
+multiple-access (CDMA) and adaptive equalization). However,
+all share a common attribute—once the modulation method
+is chosen, it is difficult to change. For example, an amplitude
+shift-keying (ASK) system cannot be simply modified to obtain
+a phase shift-keying (PSK) system owing to the complexities
+of the transmission and reception hardware. Universal radios1
+[1]–[5] change this paradigm by providing the communications
+engineer with a radio which can be programmed to produce
+almost arbitrary output waveforms and act as an almost arbi-
+trary receiver type. Thus, it is no longer unthinkable to instruct
+Manuscript received May 18, 2000; revised August 21, 2001; accepted Au-
+gust 28, 2001. The editor coordinating the review of this paper and approving
+it for publication is S. Tekinay. This work was supported in part by National
+Science Foundation under Grant CCR-99-73012.
+C. Rose and R. D. Yates are with WINLAB, Department of Electrical and
+Computer Engineering, Rutgers University, Piscataway, NJ 08854-8060 USA
+(e-mail: crose@winlab.rutgers.edu; ryates@winlab.rutgers.edu
+S. Ulukus was with WINLAB, Department of Electrical and Computer Engi-
+neering, Rutgers University, Piscataway, NJ 08854-8060 USA. She is now with
+the Department of Electrical and Computer Engineering, University of Mary-
+land, College Park, MD 20742 USA (e-mail: ulukus@umd.eng.edu).
+Publisher Item Identifier 10.1109/TWC.2002.800540.
+1Also often called software radio.
+the transmitting and receiving radios to use a more effective
+modulation in a given situation. Of course, practical radios of
+this sort are probably many years away. Nonetheless, if Moore’s
+law holds true, they are certainly on the not-too-distant horizon.
+It is, therefore, probable that wireless systems of the near fu-
+ture will have elements which adapt dynamically to changing
+patterns of interference by adjusting modulation and processing
+methods in much the same way that power control [6]–[10], is
+used today, albeit on a possibly slower time scale. Furthermore,
+if the release of 300 MHz of unlicensed spectrum in the 5-GHz
+range [11] is any indication, one might expect there to be an
+abundance of mutually interfering independent systems and no
+central control for efficient coordination. This provides added
+impetus to understand mutual interference of systems at some
+general level and implicit coordination in a multisystem envi-
+ronment.
+In this paper, we consider radios which can vary their output
+waveforms as well as their demodulation method. Our develop-
+ment starts with signal space to drive home the point that these
+techniques are applicable to a broad variety of communications
+scenarios and not only the usual “chip-based” CDMA system
+with a nondispersive channel and a single antenna. That is, if the
+problem has a signal space description, then interference avoid-
+ance can be brought to bear.2
+In this context, we consider optimal waveform selection to
+maximize the signal-to-interference ratio (SIR) for a power-con-
+strained user in the presence of interference. Starting from the
+essentially classical approach of whitening [12] and showing the
+relation to modern methods (typified by [13]), we then consider
+ensembles of users and describe a class of distributed greedy
+algorithm which can optimize their shared use of the medium.
+That is, through local self-interested action, a social optimum
+can usually be reached. Moreover, the algorithms we will de-
+scribe are simple and amenable to adaptive implementation.
+II. BACKGROUND
+Consider the classical continuous time digital communica-
+tions model, in which during an interval [ ], a signal
+is transmitted where 1 equiprobably, is the received
+power, and is the (unit energy/power) signal waveform.
+A receiver recovers , where is
+an independent interference stochastic waveform that may be
+composed of both thermal noise and interfering signals of other
+transmitters. For a single bit, the fundamental problem is to
+2Section II provides a self-contained development of the basic ideas for
+students, those new to the field, and those who like to reread good stories. It
+also shows how interference avoidance stems naturally from much older work
+(whitening filters) though under a new guise (linear receivers for multiuser
+detection). The knowledgeable reader can safely skim Section II with no loss
+of continuity.
+1536-1276/02$17.00 © 2002 IEEE
+Authorized licensed use limited to: Brown University. Downloaded on April 26,2026 at 18:59:18 UTC from IEEE Xplore. Restrictions apply.
+416 IEEE TRANSACTIONS ON WIRELESS COMMUNICATIONS, VOL. 1, NO. 3, JULY 2002
+build a receiver which guesses with minimum probability of
+error. Alternatively, when is one bit in a stream of coded bits,
+we would like to produce a soft estimate of with high signal
+to interference ratio (SIR). When is composed of known
+waveforms in addition to independent Gaussian noise, that is
+, multiuser receivers have been
+designed for a variety of objectives, e.g., minimum probability
+of error, maximum SIR, or zero interference from other users
+[13]. These multiuser systems share the property that the re-
+ceiver does as best it can given the set of transmitter signals
+.
+From the perspective of the receiver for , the interfer-
+ence is simply a stochastic process, which we assume
+zero-mean with no loss of generality. Ideally, we would like
+to obtain a set of uncorrelated (and preferably independent)
+sufficient statistics and then optimally combine these either
+to detect the bit or to derive an estimate of . When
+is Gaussian, these projections would indeed be independent
+Gaussian random variables and the optimal detection problem
+would be easily solved. A complete and rigorous development
+of the ideas can be found in [12]. Here, we provide a brief
+recapitulation.
+In general, given a stochastic process, we seek an or-
+thonormal representation
+(1)
+with . Note that in (1), the convergence
+requirement is not the usual pointwise limit, but the limit in the
+mean criterion. The interested reader is referred to [12] and [14]
+for further details. For our purposes, we assume that such an
+expansion for exists and converges. Now, we seek a special
+set of orthonormal which produce uncorrelated projections.
+(2)
+Propagating the expectation and defining
+, we obtain the integral equation
+(3)
+The solution to this integral equation requires
+(4)
+For the interested reader, the properties of (4) are discussed at
+some length in [12].
+Since integral equations are in general difficult to solve, it is
+useful to derive an equivalent discrete representation of (4). This
+will allow us to use simple methods from linear algebra. Now let
+us assume that and, therefore, the function set , can
+be well-approximated by a finite set of orthonormal basis func-
+tions on the interval [ ]. That is, we assume that the
+process has no significant energy outside some finite signal
+space. As an example, a process “almost” limited to bandwidth
+has a basis function set with about orthonormal
+functions [12], [15], [16]. Likewise, for a synchronous CDMA
+system with chips per bit, the appropriate orthonormal set
+consists of the time-shifted chip pulses. One could also use
+a space–time orthogonalization for reception/transmission an-
+tenna diversity and/or a frequency-time orthogonalization for a
+frequency-hopped system.
+Regardless of the specifics, once we assume a convenient fi-
+nite basis function set over the interval, the can then be
+represented by the finite sum
+(5)
+Combining (4) and (5) yields
+(6)
+Further, projecting the right and left hand sides onto
+yields
+(7)
+We may also rewrite the directly in terms of the projections
+as
+(8)
+Thus, (7) is a reduction of the continuous time integral (4) to a
+standard matrix eigenvalue/eigenvector equation of the form
+(9)
+where and . Each eigen-
+vector corresponds to an eigenfunction of (4) and it is easily
+verified that each eigenvalue is the amount of interference signal
+energy carried by that eigenfunction. It is also easy to verify that
+since is an autocorrelation function, is symmetric
+and positive semidefinite. This implies that has nonnegative
+eigenvalues and an associated full set of orthonormal eigenvec-
+tors which span [17].
+The receiver observes the signal
+(10)
+as input on the interval [ ]. Projecting the received signal
+onto the interference eigenfunctions , , , we ob-
+tain the vector output
+(11)
+where and have th components ,
+and the are mutually uncorrelated.
+Authorized licensed use limited to: Brown University. Downloaded on April 26,2026 at 18:59:18 UTC from IEEE Xplore. Restrictions apply.
+ROSE et al.: WIRELESS SYSTEMS AND INTERFERENCE AVOIDANCE 417
+If the do not span the signal space, then error-free re-
+ception is possible by first augmenting the basis set to span the
+signal space (via Gram-Schmidt [18] for example) and, then,
+noting that there will be no interference energy projected onto
+these augmented basis functions which carry nonzero signal en-
+ergy. Thus, with no loss of generality, we assume that the basis
+functions also span the signal space for , and con-
+tains all available information about .
+At this point it is instructive to consider the detection of
+when is a Gaussian interference process. Because we chose
+the interference eigenfunctions to yield un-
+correlated interference components , it is straightforward to
+show that the likelihood ratio test for optimal detection of be-
+comes [12], [14]
+say 1
+say 0
+(12)
+where the are the projections of onto the decorre-
+lating basis functions . This detection method is called a
+whitening filter since it can be written as
+say 1
+say 0
+(13)
+which is an initial rescaling of the input to make interference
+components ( ), already uncorrelated, have equal energy
+( ) – just as would be the case for a white noise
+process without rescaling. A matched filter on the rescaled
+signal vector components is then performed to com-
+plete the detection process.
+It is worthwhile to note that in a CDMA system where
+consists of the other users’ known signature waveforms and ad-
+ditive white Gaussian noise (AWGN), the vector with compo-
+nents is a scaled version of the well known min-
+imum mean squared error (MMSE) linear filter [19] and the de-
+cision rule (12) is the MMSE multiuser detector. We see that the
+filter output (and decision statistic)
+(14)
+contains both signal and interference terms and that the output
+SIR is
+SIR
+(15)
+It is well known that among all linear filters , the MMSE filter
+maximizes the output SIR [19]. However, (15) demonstrates that
+it remains possible to obtain a higher output SIR by altering
+the components of the desired signal . That is, when
+is subject to the unit energy constraint , we
+can maximize SIR by choosing for any
+. In this case, we have . Equivalently, we
+could distribute the signal energy in some arbitrary way over
+all such . Regardless, this result has a simple intuitively
+pleasing physical interpretation: To obtain maximum SIR, place
+all the signal energy where there is least interference. We call
+this procedure interference avoidance and for a single user with
+a given interference process, the method is straightforward. We
+now examine the implications of this simple Karhunen-Loeve
+inspired rule for an ensemble of users. We will find that the
+greedy objective in which a user adapts its signature to improve
+its SIR has desirable consequences for multiuser systems.
+III. INTERFERENCE AVOIDANCE FOR MULTIPLE USERS
+We now consider a multiuser system in which the received
+signal explicitly includes users and white Gaussian
+noise. Given the existence of a finite set of orthonormal
+basis functions for the signal space, we can express the
+received signal as the vector
+(16)
+where is the projection of the AWGN onto the basis. The
+classical communications scenario presumes that each user sig-
+nature is fixed. Assuming universal radio receivers and
+transmitters, we now allow the use of tailored signature wave-
+forms . Without loss of generality, we assume each
+has unit energy. The relationship between signature selection
+and multiuser system capacity has been studied in several papers
+[10], [20], [21]. In [20], it is shown that for a set of users’ rates
+belonging to the information theoretic achievable
+rate region , the sum capacity is
+(17)
+In (17), is the identity matrix, is the diagonal
+matrix of user’s powers , is the
+matrix with columns and is the level of white background
+noise. Note that these are the projections of the onto the
+arbitrary spanning orthogonal basis so that the may
+be called generalized codeword vectors and represent arbitrary
+signals inside an arbitrary (but finite) signal space.
+A. Maximizing Symmetric/Sum Capacity
+When the powers of the users are the same, for all ,
+(17) reduces to
+(18)
+where the last equality follows from the fact that for any two ma-
+trices and , . It was
+shown in [21] that the sum capacity for equal received powers
+is maximized if the signature sequences are chosen such that if
+(19)
+Authorized licensed use limited to: Brown University. Downloaded on April 26,2026 at 18:59:18 UTC from IEEE Xplore. Restrictions apply.
+418 IEEE TRANSACTIONS ON WIRELESS COMMUNICATIONS, VOL. 1, NO. 3, JULY 2002
+and if
+(20)
+In [10], the user capacity of a CDMA system is defined in
+terms of the maximum number of admissible users. Given the
+signal space dimensionality and a common SIR target ,
+users are said to be admissible if there exist positive powers
+and signature sequences such that each user has an SIR at
+least as large as . The user capacity was found for two kinds
+of linear receiver structures in [10]: matched filters and MMSE
+filters [19], [22]. It was shown in [10] that the user capacity
+with MMSE receivers is maximized if the received powers of
+the users are identical and if the signature sequence set satisfies
+(19) when and (20) when . When
+and (19) is satisfied or when and (20) is satisfied, the
+MMSE and matched filters are the same. Thus, reference [10]
+concludes that the user capacity of a system with matched filter
+receivers is the same as that using MMSE filters.
+In [21], the unit energy sequence sets satisfying (20) are
+called Welch bound equality (WBE) sequence sets. Welch [23]
+derived the following lower bound on the sum of the squared
+cross correlations, which we will call total squared correlation
+(TSC).
+TSC Trace (21)
+For a simple derivation of the bound (21), see [24] and [25].
+Note that sequence sets satisfying (20) satisfy the bound (21)
+with equality. We observe that the set of sequences satisfying
+either (19) for or (20) for has the property that
+the sequence set has minimum TSC. That is, to maximize both
+sum capacity and user capacity, we should choose sequence sets
+with minimum TSC.
+The relationship between sum capacity and TSC can be made
+more formal. We start by incorporating the fixed signal power
+into the signal vector energy for notational clarity. That
+is, instead of requiring , we set . We note
+that the sum capacity is then
+(22)
+Then, we define the eigenvalues of as ,
+and rewrite sum capacity as
+(23)
+essentially as was done in both [21] and [26]. Now consider
+TSC. We first note that if are the eigenvalues of
+then
+Trace (24)
+since the eigenvalues of must be [17].
+For brevity’s sake, we follow [10], [26] and note that the
+function described in (23) is Schur concave while that of (24)
+is Schur convex [27]. Since any constraints on the eigenvalues
+must be identical, and in fact form a convex set [26], [28], [29],
+we can conclude that any set which maximizes (23) must
+also minimize (24) and vice versa.3 Therefore, minimization
+of TSC is completely equivalent to maximization of . Of
+course it must be emphasized that this result does NOT imply
+equivalence between TSC and sum or symmetric capacity – but
+only that minimization of TSC implies maximization of sum ca-
+pacity.
+This result is useful since we will find that TSC minimization
+is simple and lends itself to a distributed implementation suit-
+able for use in a system of many users.
+B. Iterative Methods of TSC Reduction
+There are a number of methods which might be used to de-
+termine codeword sets which minimize TSC [10], [21], [26].
+Here, we explore simple iterative methods which can be applied
+by each transmitter/receiver pair asynchronously and indepen-
+dently.
+For a single user , we observe that
+where , the correlation matrix of the interfer-
+ence faced by user , is analogous to the matrix introduced
+in Section II. For future use, we note that Trace .
+When user replaces its signature vector with a vector ,
+the resulting difference in TSC is
+Trace Trace (25)
+After some linear algebraic manipulations, we find that
+iff
+(26)
+which reduces to
+(27)
+if as we will hereafter assume. When the interference
+faced by user includes AWGN with power spectral density
+, we may replace by if desired. As previ-
+ously, we note that minimizing Trace is equivalent to
+minimizing Trace because the trace of is
+fixed at , the total energy in the signal constel-
+lation. Thus, in terms of TSC minimization, operations on
+or are equivalent.
+Note that (27) defines a class of replacement algorithms
+whereby a given user can reduce (or at least not increase) the
+total squared correlation assuming other users’ codewords
+remain fixed during the replacement. Such an algorithm may
+be used by each user sequentially until all users have updated
+their codewords. At that point the cycle may begin anew.
+Cycles (iterations) would then be repeated changes in the TSC
+by individual codeword updates. Consideration of this process
+begs at least two questions. First, what is an example of such
+an algorithm? Second, do such algorithms eventually minimize
+TSC?
+In answer to the first question, we present two algorithms. The
+most obvious method we will call the eigen-algorithm—let
+where is a minimum eigenvalue eigenvector of . From
+(15), we see that one step of the eigen-algorithm maximizes the
+SIR of user by allowing nonzero signal energy only along
+3For those unfamiliar with majorization and Schur convexity, an alternate de-
+velopment based on Lagrange methods is provided in [28] and [29].
+Authorized licensed use limited to: Brown University. Downloaded on April 26,2026 at 18:59:18 UTC from IEEE Xplore. Restrictions apply.
+ROSE et al.: WIRELESS SYSTEMS AND INTERFERENCE AVOIDANCE 419
+those basis functions with absolute minimum . From (27),
+we see that such a choice guarantees (and thereby no
+increase in the TSC) since both the right and left hand sides of
+the condition are under-bounded by .
+We call the less obvious algorithm the MMSE algorithm since
+we replace by the unit energy MMSE receiver filter
+. We note that in the presence of
+AWGN, is always invertible. The filter is equivalent to
+forming in the decorrelated space and then renor-
+malizing where is the eigenvalue matrix of . It is known
+that codewords might be adapted for single users to obtain better
+mean square error (MSE) performance [30], [31]. The following
+theorem, proven in [9], [30], and [32] shows that the MMSE al-
+gorithm is indeed an interference avoidance algorithm.
+Theorem 1: Replacing with yields , with equality
+iff .
+Historically, the MMSE algorithm for codeword ensemble
+optimization is the first proposed interference avoidance algo-
+rithm [9], [32], [33].
+The question of convergence is addressed next where we
+find that the eigen-algorithm and the MMSE algorithm share a
+number of common properties.
+• Both algorithms decrease the TSC monotonically. Since
+TSC is bounded below by the Welch bound, they must
+converge in TSC. For the MMSE algorithm, Theorem 1
+implies that if TSC converges, then the signatures must
+converge [32]. For the eigen-algorithm, formal “conver-
+gence in class” of codeword ensembles is shown in [29].
+At fixed points of both algorithms, each is an eigen-
+vector of .
+• For neither algorithm is the resulting codeword set unique.
+For example, any rotation of the codeword set will have the
+same cross-correlation properties.
+• When , the signatures converge to an orthonormal
+set. For the MMSE algorithm, this may take several cycles.
+For the eigen-algorithm, this occurs after one cycle since
+each user chooses an eigenvector orthogonal to the previ-
+ously chosen signatures.
+• When , the algorithms may converge to a WBE
+signature set satisfying . Alterna-
+tively, both algorithms could theoretically converge to
+a local minimum for TSC. In [9], [32], and [33] mild
+conditions are derived under which the MMSE algorithm
+converges. In [34], MMSE interference avoidance is
+shown to always converge stochastically to the optimum
+signature set. Empirically, the eigen-algorithm has always
+converged to minimum TSC in experiments starting from
+random codeword vectors. In addition, a modification to
+the procedure called “class warfare” guarantees conver-
+gence to a global optimum [28], [29]. Further detail for
+eigen-algorithm fixed points is provided in Section IV.
+The intuition behind all interference avoidance algorithms
+which obey (27) is embodied by the simple requirement
+– the replacement vector attempts
+to reduce the interference from the ensemble of other user
+vectors and noise. From the standpoint of implementation, in
+the MMSE algorithm, user must identify .
+In the eigen-algorithm, user seeks a minimum eigenvalue
+eigenvector of .
+These points, taken together suggest that the class of algo-
+rithms governed by (27) could be implemented by blind tech-
+niques at the receiver along with a feedback channel to the trans-
+mitter. Specifically, in the MMSE algorithm, the receiver for
+user could be a blind adaptive MMSE filter [35] based on
+the observable . Likewise, for the eigen-al-
+gorithm, of (27) is maximized when , the sum inter-
+ference experienced by user with new codeword , is min-
+imized – equivalent to minimizing . The vector can
+also be found using blind techniques. Thus, interference avoid-
+ance algorithms are based on a measurable quantity – the inter-
+ference/noise signal correlation .
+In the MMSE algorithm, a codeword replacement by user
+requires first that the receiver filter for user converges. Fur-
+ther, the MMSE filter coefficients must be communicated to
+the transmitter via a feedback channel. Consequently, at each it-
+erative step, the speed of the algorithm is limited since: 1) the
+convergence to the MMSE filter may require several hundred
+bits and 2) several hundred bits may be needed for the feed-
+back transmission of the new signature. These same conclusions
+will also hold for the eigen-algorithm. Therefore, these signa-
+ture adaptation algorithms operate on a slower time scale than
+the algorithms for multiuser interference suppression. Thus, if
+the channel is not stable for a sufficient number of bit intervals,
+it is not clear how much advantage interference avoidance will
+confer. However, for channels which are stable over a sufficient
+number of bit intervals, signature adaptation may offer poten-
+tially large capacity increases.
+IV. FIXED POINT PROPERTIES FOR GREEDY INTERFERENCE
+AVOIDANCE ALGORITHMS
+Unfortunately, for there is no guarantee that
+interference avoidance always leads to an optimal fixed point.
+For example, from (27) can be zero over a full cycle of
+an interference avoidance algorithm even though the min-
+imum eigenvalues might not all be equal as required for
+. An illustration of such a suboptimal signal
+set is provided in Fig. 1 and the corresponding optimal set in
+Fig. 2.
+We now examine the nature of such suboptimal fixed points
+in more detail.4 The convergence properties of the MMSE algo-
+rithm are described in [9] and [32]–[34]. In this paper, our focus
+will be on the eigen-algorithm, or more generally, on any greedy
+algorithm which always chooses codeword replacements which
+increase its SIR when at all possible. Or equivalently, for all
+interference avoidance algorithms whose only fixed points are
+those such that the equilibrium codewords for agile users are
+minimum eigenvalue eigenvectors of their respective . This
+condition leads easily to simple structural conditions on glob-
+ally optimal algorithm fixed points.
+A. Fixed Points for Equal-Power Agile Users
+We start with a Lemma.
+4For simplicity, we assume no uniform background noise, noting that the min-
+imization of TSC is the same whether we consider R or Z .
+Authorized licensed use limited to: Brown University. Downloaded on April 26,2026 at 18:59:18 UTC from IEEE Xplore. Restrictions apply.
+420 IEEE TRANSACTIONS ON WIRELESS COMMUNICATIONS, VOL. 1, NO. 3, JULY 2002
+Fig. 1. Simple suboptimal signal set in two dimensions with three users.
+Fig. 2. Simple optimal signal set in two dimensions with three users.
+Lemma 1: If is a fixed point of a greedy interference
+avoidance algorithm with minimum eigenvalue ensemble ,
+the eigenvalue set of each contains and where
+. Furthermore, all corresponding are also eigenvec-
+tors of .
+Proof: Lemma 1: Since is an eigenvalue of ,
+. Observing that , we have
+. Both and are eigenvectors of
+, but since we assume , they must be orthogonal.
+This implies , thus, proving the theorem.
+We then use Lemma 1 to show that interference avoidance
+must produce codeword ensembles which span the signal space
+as well as provide bounds on the differences in performance
+between codeword SIRs.
+Theorem 2: Let be a fixed point with having
+eigenvalues . The distinct eigenvalues,
+satisfy for , . Furthermore, the
+signal vectors associated with each distinct eigenvalue form
+mutually orthonormal subspaces which collectively span .
+Proof: Theorem 2: Each is an eigenvector of . As-
+sume the eigenvalue of associated with is . In this
+case, the minimum eigenvalue of must be .
+Suppose, without loss of generality, that for some
+. This would imply , which is a contradiction
+since by Lemma 1, is the minimum eigenvalue of . For
+the second part, we note that since is symmetric, distinct
+eigenvalues correspond to orthogonal eigenvectors. Since each
+of the is also an eigenvector of , then the vectors as-
+sociated with given eigenvalues form mutually orthogonal sub-
+spaces of . If these subspaces did not collectively span ,
+then would have an eigenvector with zero eigenvalue.
+This would imply that any signature with could be
+replaced by to reduce TSC, which would be a contradiction.
+As an aside which brings closure with the results of [10] and
+[21], we provide the following simple corollary to Theorem 2.
+Corollary 1: Let . If the set comprises a
+fixed point with having eigenvalues ,
+, then and .
+That is, since any positive semidefinite matrix such as
+is always diagonalizable – as opposed to having a Jordan form
+[17] – we must have .
+Since as noted previously, Trace , we must have
+.
+In summary, there are the optimal fixed points with
+for , and the suboptimal fixed
+points with vectors in mutually orthogonal subspaces
+corresponding to each different – which cannot differ from
+each other by more than one. If all the are identical, then
+the ensemble correlation is an identity matrix. That is, the
+ensemble is essentially whitened.
+Our worry, of course, is that the algorithm will converge to a
+suboptimal point. Fortunately, in all our experience with numer-
+ical studies suboptimal minima have never been obtained when
+the starting ensemble is chosen randomly. Only when the initial
+set is not full rank or when the component vectors can be par-
+titioned into mutually orthogonal subspaces does the algorithm
+not always converge to an optimal codeword ensemble.
+B. Fixed Points for Mixtures of Fixed and Agile Users
+It is likely that users with both fixed and agile waveform ra-
+dios may need to occupy the same signal space. We now con-
+sider this scenario and find the intuitively pleasing result that
+using the eigen-algorithm, the agile users perform a sort of ag-
+gregate waterfilling over the portion of the signal space with
+least fixed user energy to achieve an optimum SIR. Put another
+way, the fixed users appear as colored noise to the agile users
+which causes an appropriate Shannonesque distribution of agile
+user signal energy over the signal space. It is readily understood
+that this feature is of benefit, on average, to the fixed users as
+well since it implies that the agile users avoid the fixed users
+where possible. We also note that the implied minimization of
+ensemble TSC (including the fixed user signatures) is equiva-
+lent to maximization of information theoretic sum capacity [28],
+[29], [36].
+Formally, we let the set be the set of signal
+vectors associated with waveform-agile users. Let
+be the signal vectors associated with fixed-waveform
+Authorized licensed use limited to: Brown University. Downloaded on April 26,2026 at 18:59:18 UTC from IEEE Xplore. Restrictions apply.
+ROSE et al.: WIRELESS SYSTEMS AND INTERFERENCE AVOIDANCE 421
+users. Greedy interference avoidance will only be applied to the
+. We define
+(28)
+We also define the mutually orthogonal eigenvectors of as
+with associated eigenvalues .
+First consider the case where there are fewer agile users
+than dimensions . The agile users cannot span the entire signal
+space. Thus, we must ask in what portion of the signal space
+should the agile users reside to achieve minimum interference.
+The answer, though intuitively obvious, is stated as a theorem
+and proven.
+Theorem 3: If there are agile users, then the inter-
+ference experienced by at least one agile user can be reduced
+(while not increasing the interference seen by other agile users)
+unless the set is contained in the space spanned by the
+eigenvectors of with the smallest eigenvalues.
+Note that Theorem 3 can also be restated in terms of TSC
+since reduction of interference for one user while not increasing
+that seen by other users clearly reduces TSC.
+Proof: Theorem 3: At equilibrium, we have
+(29)
+for an interference avoidance algorithm. We note that the di-
+mension of the space in which the reside is ,
+and that we can linearly combine the to derive mutually
+orthonormal eigenvectors of . However, has a full
+set of eigenvectors so there exists an additional set of
+eigenvectors each of which is orthogonal to the . If ,
+is one such eigenvector, then it must also
+be an eigenvector of since
+(30)
+With no loss of generality, let us assume that the first
+eigenvectors of , are exactly these and that the corre-
+sponding eigenvalues are exactly the .5 Since the eigen-
+vectors collectively span and the eigenvectors
+comprise the orthogonal complement of the ,
+we can expand the in , as
+(31)
+with .
+The interference experienced by user is which we can
+write as
+(32)
+Using (31), we obtain after some simplification
+(33)
+5We then note that  might not be an eigenvector of SS for j = N  Q +
+1; . . . ; N .
+Now suppose that for some and
+, we have . For the fixed, if
+we swap with , the only term in (33) which can change
+is the second sum on the right-hand side. Since this substitution
+cannot increase any of the we will not increase any .
+In fact, we will reduce for at least one value of since there
+must exist some for which by the condition that
+the space spanned by the , and the
+space spanned by the are coincident.
+Therefore, unless for and
+, the interference experienced by at least
+one of the agile users can be reduced by the substitution of basis
+vectors described above without increasing the interference seen
+by the other agile users. Therefore, to achieve minimum mutual
+interference, the must reside in the space spanned by the
+eigenvectors of with smallest eigenvalues. Since
+this space is contained in the space spanned by the eigenvec-
+tors of with smallest eigenvalues, the theorem is proved.
+We can, therefore, assume with no loss of generality that
+– since if not, we simply recast the problem in a space of
+dimension following Theorem 3. We now provide a
+bound for the minimum TSC.
+Theorem 4: When with fixed
+Trace (34)
+where the are the eigenvalues of ordered from largest
+to smallest, and . This
+bound is met with equality when the eigenvalues of are
+where
+has multiplicity .
+Proof: Theorem 4: First we write in terms of the
+eigenvectors of with and
+. Using (28), we have
+(35)
+Remembering that Trace , we form
+and then take the trace to obtain
+Trace
+(36)
+We define the agile energy contained in as
+and note that the total agile
+signal energy. The corresponding energy in the fixed signals is
+by the definition of the . We can then
+rewrite (36) as
+Trace
+(37)
+Authorized licensed use limited to: Brown University. Downloaded on April 26,2026 at 18:59:18 UTC from IEEE Xplore. Restrictions apply.
+422 IEEE TRANSACTIONS ON WIRELESS COMMUNICATIONS, VOL. 1, NO. 3, JULY 2002
+The terms in the left-hand sum are nonnegative, thus,
+Trace , which is convex in the
+. Since we require and , application
+of standard constrained optimization techniques [37]–[39]
+provides a classical waterfilling result. Defining the “water
+level” as with as defined
+in the theorem statement, we have when and
+otherwise. Thus
+Trace (38)
+thereby, proving the first part of the theorem. Now,
+Trace where the are eigenvalues
+of . Using the eigenvalues for defined in the theorem
+statement completes the proof.
+Experimentally, for randomly chosen initial codeword vec-
+tors and , invariably the lower bound of Theorem 4
+was attained. Analytically, the existence of such signal sets is
+guaranteed by application of a variant of the eigen-algorithm
+[28], [29]. As for agile-only users, a modification to the algo-
+rithm guarantees convergence to the optimum. Thus, greedy in-
+terference avoidance algorithms seek a minimum mutual inter-
+ference set of agile vectors by “water filling” the energy levels
+provided by the fixed users, and avoiding completely energetic
+interference above a certain threshold.
+Also note that as a byproduct, we have also shown that the
+algorithm seeks a minimum mutual interference set of vectors
+in a background of colored noise. That is, the effect of the fixed
+users came into play only through the eigenvalues and eigenvec-
+tors of which could be considered as the autocorrelation
+matrix of some arbitrary colored noise process.
+Finally, we note that as in the agile-only case, there are op-
+timal fixed points where the agile users obtain uniformly max-
+imum SIR, and suboptimal fixed points where groups of dif-
+ferent agile users obtain differing SIRs. In the suboptimal case,
+it is easily shown that once again, the agile users are partitioned
+into mutually orthogonal subspaces according to the SIR ob-
+tained. Fortunately, also as with the agile-only case, random
+choice of initial vectors precluded convergence to a sub-
+optimum minimum in all our numerical experiments.
+C. Fixed Points for Interference Avoidance With Unequal
+Power
+In this section, we consider the case where each user has ar-
+bitrary but fixed received power . We will find that interfer-
+ence avoidance achieves eigenvalues for identical to those
+shown in [26] to maximize the sum capacity. We explicitly add
+white Gaussian background noise so that capacity is well-de-
+fined although this is not a necessary feature for interference
+avoidance to be effective. We remind the reader that we assume
+at least as many users as signal dimensions since in the
+event , the users will confine themselves to dimen-
+sions. Note also once again that we have incorporated the signal
+power into the code vector ; i.e., .
+In an AWGN background, at equilibrium, we require
+(39)
+With , we have
+(40)
+The quantity is the inverse of the signal-to-in-
+terference-plus noise ratio (SINR) achieved by the th user. We
+choose as small as possible which in turn implies we choose
+the minimum eigenvalue eigenvector of as previously dis-
+cussed. We also have Trace where .
+Likewise, Trace is not increased by an interference
+avoidance algorithm which replaces with an of equal power
+[see (26)].
+Since the interference avoidance algorithm cannot increase
+Trace , we now seek a lower bound for Trace .
+We have Trace where the are the
+eigenvalues of . Consider then that for any signal with
+power , the corresponding eigenvalue of is at least
+. This forms the basis for the constraint on the eigenvalues
+of mentioned in Section III-A and is identical to the
+constraint on the derived for sum capacity in [26]. That is,
+and we have in
+general
+Trace (41)
+with and assuming ordered energies, . Further
+assuming ordered eigenvalues we have ,
+.
+Since the eigenvalues must sum to , we have
+. The minimization of Trace requires 0
+if and when . Once again, the
+“water level” which satisfies the power constraint equation is
+(42)
+where
+(43)
+Thus, is an eigenvalue of with multiplicity and
+the complete set of eigenvalues of is
+(44)
+From (40), we see that
+(45)
+If no , we then have the usual uniform solution of
+( ) and consequently
+(46)
+Overall, these results have a facetious but memorable interpre-
+tation Might makes right. That is, those users with greater re-
+ceived power obtain better performance. In fact, the exces-
+sively energetic users command private channels. Such users
+are called oversized in [26], a term coined by S. Verdu.
+Authorized licensed use limited to: Brown University. Downloaded on April 26,2026 at 18:59:18 UTC from IEEE Xplore. Restrictions apply.
+ROSE et al.: WIRELESS SYSTEMS AND INTERFERENCE AVOIDANCE 423
+Fig. 3. Vector plot of five signal vectors in three-space after five cycles
+of interference avoidance. Signal vectors are represented as hollow inverted
+pyramids for greater clarity of the 3-dimensional (3-D) representation.
+It is worth noting again that minimizing Trace
+also minimizes Trace . Since minimizing
+Trace under constraints on the eigenvalues is
+equivalent to maximizing the sum capacity (see Section III-A)
+under the same constraints, the eigenvalues of given in
+(44) imply a codeword set which can achieve the sum capacity.
+Furthermore, when no , we have 0 and
+. This implies an absolute minimum TSC which in
+turn implies an absolute maximum sum capacity. This result
+is in agreement with that provided in [26] where an existence
+proof for such codeword sets can also be found.
+Finally we note, once again, that suboptimal minima may be
+obtained in which users are partitioned into mutually orthogonal
+subspaces with differing SINR characteristics. Also as before,
+these subpoptimal fixed points seem to be avoided by starting
+from initially random codewords and that convergence to op-
+timum can be forced by a modification of the greedy interfer-
+ence avoidance procedure [28], [29].
+V. DISCUSSION
+A. Eigen-Algorithm: Numerical Examples
+Here, we provide example applications of interference avoid-
+ance to the scenarios analyzed in this paper. Fig. 3 shows CDMA
+chip sequences for five agile users with three chips after five
+interference avoidance cycles. The resultant associated is
+approximately diagonal
+and each unit energy user achieves a signal to interference ratio
+of approximately 1.5.
+Fig. 4. Vector plot of five signal vectors (three agile and two fixed) after five
+cycles of interference avoidance. Notice the coplanarity of the three agile signal
+vectors in avoidance of a strong fixed interferer component along the remaining
+dimension.
+Fig. 5. Vector plot of four signal vectors, three with power 1 and the remaining
+with power 4. Notice the coplanarity of the three power 1 vectors in avoidance
+of the strong interferer with power 4.
+In Fig. 4, we allow only the first three signals to be agile and
+fix the remaining two. After five cycles the three agile users re-
+side in a space of dimension 2 (coplanar) achieving approxi-
+mately 1.6 and a concomitant signal to interference ratio
+of approximately 1. 66. They avoid a strong fixed
+user interference component (with energy 1.8) in the remaining
+dimension.
+In Fig. 5, we assume four users, one of whom has much larger
+power than the others ( 4). This energetic user commands a
+private channel and the remaining three users are forced to share
+Authorized licensed use limited to: Brown University. Downloaded on April 26,2026 at 18:59:18 UTC from IEEE Xplore. Restrictions apply.
+424 IEEE TRANSACTIONS ON WIRELESS COMMUNICATIONS, VOL. 1, NO. 3, JULY 2002
+Fig. 6. Histogram of norm squared difference between initial and convergent
+waveforms after addition of a single new user to an optimal signal set of 24 users
+in 16 signal dimensions. The central interval (0.2,3.7) over which there were no
+occurrences was compressed for clarity.
+two dimensions of the signal space – again the weaker users are
+coplanar – and have for a shared SIR of two.
+B. Addition and Deletion of Users: Convergence Speed and
+Codeword Stability
+We have not conducted rigorous convergence-speed exper-
+iments for greedy interference avoidance algorithms. For the
+MMSE algorithm, however, the settling time seems rapid [9],
+[33] with near-convergence to minimum TSC within a three or
+four iteration cycles. In 100 trials using 24 and
+16, the evolution of Trace for the eigen-algorithm also
+converged within a few iteration cycles.
+However, much more interesting from a system standpoint
+is the issue of what occurs when a given set of users are dis-
+turbed by the addition or deletion of a user. How rapidly does
+the system settle after the perturbation? Perhaps even more im-
+portant is the question of how much the signatures change since
+large signature adjustments may imply large signaling load on
+the codeword feedback channel.
+After one hundred trials where a single user was either added
+to or deleted from an already settled system with 24 users in
+16 dimensions, we found that convergence was once again
+rapid and occurred within three ensemble waveform update
+cycles. The magnitude squared of the difference between
+the preaddition/deletion codewords and the final convergent
+codewords was used as a measure of codeword volatility. A
+square difference of zero or four implies respectively, identical
+initial and final codewords, or codewords which differ only
+in sign. A square difference of two implies a final codeword
+orthogonal to the initial.
+The results are plotted as histograms in Figs. 6 and 7. As
+can be seen, the post deletion codewords are more volatile than
+the post addition codewords. However, neither convergent set
+often differs much from their preaddition/deletion counterparts.
+Where they do differ significantly (square difference approxi-
+mately four), the original codeword has simply been inverted.
+We believe this to be an artifact of the manner in which eigen-
+vectors are chosen for the eigen-algorithm although we have
+not pursued the issue carefully. Regardless, these limited results
+Fig. 7. Histogram of norm squared difference between initial and convergent
+waveforms after deletion of a single user from an optimal signal set of 24 users
+in 16 signal dimensions. The central interval (0.4,3.5) over which there were no
+occurrences was compressed for clarity.
+Fig. 8. Histogram of norm squared difference between initial and convergent
+waveforms for 24 users in 16 signal dimensions.
+seem to indicate that codeword adaptation under arrivals and de-
+partures could be more orderly and rapid than might initially be
+imagined.
+For comparison, we also provide a histogram (Fig. 8) which
+shows the difference between initial random codewords and the
+WBE-converged ensemble. Note that the difference between
+initial and final codewords is much more pronounced than in
+Figs. 6 or 7. However, it is also apparent that there are also
+many codewords which do not differ greatly from their initial
+randomly chosen value ( ), or only in sign ( ). Thus, even
+during system startup, the amount of feedback to transmitters
+might not be excessive.
+We close this section with a caveat. Studies of convergence
+rate based on perfect information are chimeric. In practical
+systems where information is imperfect, stochastic convergence
+studies [8] are necessary, and as a general rule, the convergence
+rate is much slower. Nonetheless, perfect information can
+often be used to suggest an upper bound on convergence
+properties. That is, were convergence slow and codewords
+volatile, there would be little hope of rapid and stable behavior
+under imperfect information. However, it should also be noted
+Authorized licensed use limited to: Brown University. Downloaded on April 26,2026 at 18:59:18 UTC from IEEE Xplore. Restrictions apply.
+ROSE et al.: WIRELESS SYSTEMS AND INTERFERENCE AVOIDANCE 425
+that imperfect measurements tend to randomize the codeword
+replacement process slightly which, following our results for
+random initial codewords, would tend to favor convergence to
+the optimum. In fact, it is exactly this property which guarantees
+MMSE interference avoidance convergence to optimal [34].
+C. A Simple Comparison to S-CDMA
+Suppose that in an interference limited system (assume no
+background noise) a signal to interference ratio of is required
+for each user. The maximum number of users which can be sup-
+plied the requisite is called the user capacity of the system
+[10]. The work presented, thus, far begs a comparison to CDMA
+systems since the basic ideas – spreading users over the signal
+space – are very similar.
+Since exact comparisons are difficult even between systems
+with known operating characteristics (i.e., the raging debate be-
+tween TDMA and CDMA), we opt for the high road and con-
+sider only simple measures for comparison. Furthermore, we
+will ignore such issues as relative immunity to various channel
+impairments. We will also not attempt to make estimates of re-
+ceiver complexity in any real sense since with changing tech-
+nology, what is complex today may be standard tomorrow. The
+most obvious comparison is single-base system capacity. Al-
+though it is well known that CDMA is inefficient in this regard
+and we all expect almost any system which attempts to orthog-
+onalize user signatures to be far superior, the single-base com-
+parison will aid us in comparing simple measures of multibase
+performance.
+For a synchronous CDMA (S-CDMA) system with randomly
+chosen -chip signature sequences, the user capacity with
+simple matched filters is upper bounded by [40]. For a
+system employing interference avoidance with matched filters,
+we have determined that at convergence, the user capacity
+is . The ratio of user capacity of interference
+avoidance to S-CDMA systems is, therefore, at least
+(47)
+We note that this improvement is identical to that obtained
+where MMSE filters as opposed to matched filters are used
+with random codewords [40].
+For 1 (0 dB) the gain is approximately two. For 4
+(6 dB), the gain is approximately five. Thus, as expected, signa-
+tures generated by interference avoidance greatly increase the
+single-base user capacity of S-CDMA systems. Furthermore,
+the basic receiver structure (again, conveniently excluding the
+machinery necessary to calculate and disseminate the signa-
+tures) is conceptually simple – a matched filter.
+Of course, it would be more interesting to compare the multi-
+base performance of these systems. The current thinking is that
+although single-base CDMA is inefficient, when multiple con-
+tiguous coverage regions are added, CDMA is more efficient
+and robust than other modulation methods such as TDMA or
+FDMA. The details of any rigorous comparison lie outside the
+scope of this paper, so again we opt for simplicity.
+Thus, consider an S-CDMA system model where each cell
+carries users and the total other-cell interference energy for
+any given cell is per dimension where is some non-
+negative constant. That is, we approximate all the interference
+energy from all other cells as white over the signal space with
+aggregate interference energy .
+The SIR for each user assuming matched filters and random
+signatures is
+(48)
+for a user capacity of
+CDMA (49)
+Unfortunately, a direct comparison to a system employing in-
+terference avoidance is as yet impossible since the multiple base
+interference avoidance problem has not yet been solved. How-
+ever, we note that for a given cell with other-cell noise energy
+, the worst interference spectral structure from a capacity
+standpoint would be white since interference avoidance could
+exploit the structure of nonwhite interference. Thus, taking on
+faith (and limited empirical observations under specific sce-
+narios) that fixed points indeed exist for multiple base systems
+employing interference avoidance, we see that at each base,
+the “worst case” attainable interference-to-signal ratio (ISR) is
+which implies
+IA (50)
+—an expected improvement of over
+S-CDMA.
+This approximate comparison, even if flawed by the unknown
+behavior of interference avoidance in a multiple base setting,
+suggests that exploration of interference avoidance as a means to
+increase system capacity will merit further investigation. Of par-
+ticular interest will be some of the issues raised previously, prin-
+cipal among them, whether interference avoidance can be used
+effectively with dispersive channels. Recent work [41] where a
+version of multicarrier modulation is adopted suggests the an-
+swer is yes.
+VI. SUMMARY AND CONCLUSION
+Starting from a general signal space foundation, we have de-
+rived a class of interference avoidance algorithms whereby indi-
+vidual users asynchronously adjust their transmitted waveforms
+and corresponding matched filter receivers to minimize inter-
+ference from other sources, including other users. This method
+presupposes that transmitters and receivers are waveform agile
+as would be the case assuming universal radios [1]–[5] are in-
+expensive and ubiquitous.
+The interference avoidance procedure, based on SIR as
+opposed to individual capacity maximization, minimizes total
+square correlation (TSC). We pursued the relation between
+sum capacity maximization [10], [25], [26] and minimization
+of TSC and found equivalence (see Section III-A) in a white
+noise environment. Specifically, minimization of total square
+correlation results in signature sets which can also be used to
+achieve sum channel capacity (through Gaussian signaling).
+The minimization/maximization is often achieved through a
+satisfyingly information theoretic “waterfilling” of the signal
+space by the ensemble of users. Note that this waterfilling is
+Authorized licensed use limited to: Brown University. Downloaded on April 26,2026 at 18:59:18 UTC from IEEE Xplore. Restrictions apply.
+426 IEEE TRANSACTIONS ON WIRELESS COMMUNICATIONS, VOL. 1, NO. 3, JULY 2002
+essentially an “emergent” property of the ensemble since in-
+dividual users seek not to maximize their capacity (via water-
+filling), but rather, only seek to maximize their own SINR. Com-
+binations of fixed and agile users (or agile users in colored back-
+ground noise, see Section IV-B) as well as users with unequal
+received powers (Section IV-C) were analyzed as examples.
+Numerical experiments were conducted which corroborated
+the basic analytic results. Further experiments, aimed at deter-
+mining whether interference avoidance might be used in prac-
+tical systems were also conducted. These included measure-
+ments of convergence speed and codeword set volatility under
+the addition or deletion of a single user. In all cases the results
+were encouraging. It is also worth noting that experimentally,
+suboptimal sets were never obtained when starting from ran-
+domly chosen codewords and no modifications of the basic in-
+terference avoidance procedure (as in [28] and [29]) were nec-
+essary.
+Simple comparisons to synchronous CDMA show that for a
+single cell, the number of users serviceable at reasonable SIRs
+is much greater and scales approximately with the required SIR.
+This is not surprising since almost any scheme which attempts
+to orthogonalize signature waveforms will have much greater
+capacity than a single-base CDMA system. More telling is the
+comparison of systems for multiple bases where rough calcu-
+lations suggest substantial improvement may be had using in-
+terference avoidance methods, although these results must be
+interpreted in light of the fact that the behavior of multiple base
+interference avoidance is as yet unknown. Furthermore, aside
+from the assumption of waveform agility and the necessity of
+measuring interference to calculate the optimal signature, the
+optimum linear transmit and receive methods are very simple
+— matched filter detection.
+We close with a (nonexhaustive) sampling of problem areas,
+both theoretical and practical, which must be addressed if in-
+terference avoidance is to become a useful tool for wireless
+system design. First, the issue of the proper venue for interfer-
+ence avoidance must be established. By virtue of the necessity
+for interference measurement over a large number of bit inter-
+vals for each waveform update and the asynchronicity of the
+algorithm over multiple users, it is not obvious whether inter-
+ference avoidance can be effective in situations where the wire-
+less channel is changing significantly over, say 1000 or 10000,
+bit intervals, though there are hints that even in such circum-
+stances, IA affords some improvement [42]. Regardless, a fixed
+wireless environment might be most appropriate for application
+of interference avoidance methods.
+We note that despite the assumption of perfect channels
+used in this paper, wireless channels are notoriously dispersive,
+and when signal energy for each bit is not contained within a
+single received bit interval, the problem formulation changes.
+Nonetheless, recent results show that interference avoidance
+methods seem to be robust and are applicable to dispersive
+systems, asynchronous systems and multiple antenna systems
+as well [41]–[50].
+As noted, we have found the speed and stability with which
+codeword ensembles converge surprising. Especially intriguing
+is the seemingly certain convergence to an optimal set when
+starting from a randomly chosen starting set and the ease with
+which suboptimal fixed points are escaped through perturbation.
+It has been shown that for MMSE interference avoidance this
+property is a result of stochastic convergence and that MMSE
+interference avoidance must converge with probability 1 to op-
+timal fixed points in the cases considered [34]. In fact, a modi-
+fication of greedy interference avoidance called “class warfare”
+can be used to escape the finite number of local minima and re-
+sults in provable convergence to minimum TSC [28], [29]. But
+frustratingly, a general proof for greedy interference avoidance
+which reflects the uncannily uniform convergence seen in prac-
+tice without escape methods remains elusive.
+The issue of codeword representation and fidelity in a real
+software/universal radio has been considered only empirically
+at present [51], [52]. Specifically, instead of uniform-amplitude
+codeword “chips,” interference avoidance presumes real-valued
+“chips” or more generally, real-valued coefficients for a set of
+orthonormal signal basis functions used by the transmitter and
+receiver. To be effective, these values must be communicated to
+the transmitter, and the amount of information which may be fed
+back to the transmitter will determine quantization methods for
+codewords. It is not currently known how quantization affects
+the performance of interference avoidance, although empirical
+investigation seems to indicate that in the vecinity of four-bits
+per chip using Gaussian quantization is sufficient.
+Finally, it must be emphasized that only a single receiver
+(or colocated multiple receivers) were assumed for this study.
+Limited experiments with multiple receivers and power control
+showed unstable behavior when interference avoidance was di-
+rectly applied and some art was required to achieve reasonable
+fixed points. An understanding of the multiple receiver problem
+is, therefore, paramount in determining the utility of interfer-
+ence avoidance in real systems.
+Nevertheless, owing to the simplicity of the concept and the
+ever increasing sophistication of radio hardware, we expect that
+interference avoidance will afford an interesting new perspec-
+tive which might even evolve into a practical method for wire-
+less system design. If so, we expect it to be especially useful in
+unlicensed bands such as the U-NII, where users can mutually
+interfere with officially sanctioned impunity [11].
+REFERENCES
+[1] “Special issue on software radio,” IEEE Personal Commun. Mag., vol.
+6, no. 4, Aug. 1999.
+[2] I. Seskar and N. Mandayam, “Software Defined Radio Architectures for
+Interference Cancellation in DS-CDMA Systems,” IEEE Pers. Commun.
+Mag., vol. 6, pp. 26–34, Aug. 1999.
+[3] I. Seskar and N. B. Mandayam, “A Software Radio Architecture for
+Linear Multiuser Detection,” IEEE J. Select. Areas Commun., vol. 17,
+pp. 814–823, May 1999.
+[4] J. Mitola, “The software radio architecture,” IEEE Commun. Mag., vol.
+38, p. 26, May 1995.
+[5] S. Sheng, R. Allmon, L. Lynn, I. O’Donnell, K. Stone, and R. Brodersen,
+“A Monolithic CMOS Radio System for Wideband CDMA Communi-
+cations,” in Proc. Infopad FTP Archive, 1998.
+[6] S. V. Hanly, “An algorithm for combined cell-site selection and power
+control to maximize cellular spread spectrum capacity,” IEEE J. Select.
+Areas Commun., vol. 13, pp. 1332–1340, Sept. 1995.
+[7] R. Yates, “A framework for uplink power control in cellular radio sys-
+tems,” IEEE J. Select. Areas Commun., vol. 13, pp. 1341–1348, Sept.
+1995.
+[8] S. Ulukus and R. Yates, “Stochastic power control for cellular radio sys-
+tems,” IEEE Trans. Commun., vol. 46, pp. 784–798, June 1998.
+Authorized licensed use limited to: Brown University. Downloaded on April 26,2026 at 18:59:18 UTC from IEEE Xplore. Restrictions apply.
+ROSE et al.: WIRELESS SYSTEMS AND INTERFERENCE AVOIDANCE 427
+[9] S. Ulukus, “Power Control, Multiuser Detection and Interference Avoid-
+ance in CDMA Systems,” Ph.D. dissertation, Rutgers University, Dept.
+Elect. Comp. Eng., NJ, 1998.
+[10] P. Viswanath, V. Anantharam, and D. Tse, “Optimal sequences, power
+control and capacity of spread-spectrum systems with multiuser
+receivers,” IEEE Trans. Inform. Theory, vol. 45, pp. 1968–1983, 1999.
+[11] “FCC Report and Order 97-5: Amendment of the commission’s rules to
+provide for operation of unlicensed NII devices in the 5 GHz frequency
+range,” Federal Communications Commission, ET Docket-102, 1997.
+[12] H. L. Van Trees, Detection, Estimation, and Modulation Theory. New
+York: Wiley, 1968, pt. I.
+[13] S. Verdu, Multiuser Detection. Cambridge, U.K.: Cambridge Univ.
+Press, 1998.
+[14] A. Papoulis, Probability, Random Variables, and Stochastic Processes,
+3rd ed. New York: McGraw-Hill, 1991.
+[15] T. M. Cover and J. A. Thomas, Elements of Information Theory. New
+York: Wiley, 1991.
+[16] J. M. Wozencraft and I. M. Jacobs, Principles of Communication Engi-
+neering. New York: Wiley, 1965.
+[17] G. Strang, Linear Algebra and Its Applications, 2nd ed. New York:
+Academic, 1992.
+[18] S. Haykin, Communication Systems. New York: Wiley, 1994.
+[19] U. Madhow and M. L. Honig, “MMSE interference suppression for di-
+rect-sequence spread-spectrum CDMA,” IEEE Trans. Commun., vol.
+42, pp. 3178–3188, Dec. 1994.
+[20] S. Verdú, “Capacity region of Gaussian CDMA channels: The symbol-
+synchronous case,” in Proc. Allerton Conf. Communications, Control
+and Computing, Oct. 1986, pp. 1025–1034.
+[21] M. Rupf and J. L. Massey, “Optimum sequence multisets for syn-
+chronous code-division multiple-access channels,” IEEE Trans. Inform.
+Theory, vol. IT-40, pp. 1261–1266, July 1994.
+[22] Z. Xie, R. T. Short, and C. K. Rushforth, “A family of suboptimum de-
+tectors for coherent multiuser communications,” IEEE J. Select. Areas
+Commun., vol. 8, pp. 683–690, May 1990.
+[23] L. R. Welch, “Lower bounds on the maximum cross correlation of sig-
+nals,” IEEE Trans. Inform. Theory, vol. IT-20, pp. 397–399, May 1974.
+[24] J. L. Massey, “On welch’s bound for the correlation of a sequence set,”
+in Proc. IEEE Int. Symp. Information Theory (ISIT’91), 1991, p. 385.
+[25] J. L. Massey and T. Mittelholzer, “Welch’s bound and sequence sets
+for code-division multiple access systems,” in Sequences II: Methods in
+Communication, Security and Computer Science, R. Capocelli, A. De
+Santis, and U. Vaccaro, Eds. New York: Springer-Verlag, 1991.
+[26] P. Viswanath and V. Anantharam, “Optimal sequences and sum capacity
+of synchronous cdma systems,” IEEE Trans. Inform. Theory, vol. 45,
+pp. 1984–1991, Sept. 1999.
+[27] A. W. Marshall and I. Olkin, Inequalities: Theory of Majorization and
+its Applications. New York: Academic, 1979.
+[28] C. Rose, “Sum capacity and interference avoidance: convergence via
+class warfare,” in Proc. CISS 2000, Princeton, NJ, Mar. 2000.
+[29] , “Cdma codeword optimization: interference avoidance and con-
+vergence via class warfare,” IEEE Trans. Inform. Theory, vol. 47, pp.
+2368–2382, Sept. 2001.
+[30] P. B. Rapajic and B. S. Vucetic, “Linear adaptive transmitter-receiver
+structures for asynchronous CDMA,” European Trans. Telecomm., vol.
+6, pp. 21–28, Jan. 1995.
+[31] M. Honig and V. Veerakachen, “Performance variability of linear mul-
+tiuser detection for DS-CDMA,” in Proc. IEEE Vehicular Technology
+Conf. VTC96, Apr. 1996, pp. 372–376.
+[32] S. Ulukus and R. D. Yates, “Iterative construction of optimum signature
+sequence sets in synchronous CDMA systems,” IEEE Trans. Inform.
+Theory, vol. 47, pp. 1989–1998, July 2001.
+[33] , “Iterative signature adaptation for capacity maximization of cdma
+systems,” in Proc. Allerton Conf. Communication, Control, and Com-
+puting, Sept. 1998.
+[34] P. Anigstein and V. Anantharam, “On the Convergence of the MMSE Al-
+gorithm for Interference Avoidance,” in Proc. 38th Allerton Conf. Com-
+munication, Control, and Computing, Oct. 2000.
+[35] M. Honig, U. Madhow, and S. Verdú, “Blind adaptive multiuser detec-
+tion,” IEEE Trans. Inform. Theory, vol. 41, pp. 944–960, July 1995.
+[36] P. Viswanath and V. Anantharam, “Total Capacity of Vector Channels,”
+College of Engineering, U.C. Berkeley, UCB/ERL Memorandum 99/47,
+1999.
+[37] F. B. Hildebrand, Advanced Calculus for Applications. Englewood
+Cliffs, NJ: Prentice-Hall, 1976.
+[38] G. L. Nemhauser, A. H. G. Rinnooy Kan, and M. J. Todd, Eds., Opti-
+mization. North-Holland: Elsevier, 1989.
+[39] D. P. Bertsekas, Constrained Optimization and Lagrange Multiplier
+Methods. San Diego, CA: Academic, 1982.
+[40] D. Tse and S. Hanly, “Linear Multiuser Receivers: Effective Interfer-
+ence, Effective Bandwidth and User Capacity,” IEEE Trans. Inform.
+Theory, vol. 45, pp. 641–657, Mar. 1999.
+[41] D. C. Popescu and C. Rose, “Interference Avoidance and Dispersive
+Channels. A New Look at Multicarrier Modulation,” in Proc. 37th
+Allerton Conf. Communication, Control, and Computing, Monticello,
+IL, Sept. 1999, pp. 505–514.
+[42] , “Fading Channels and Interference Avoidance,” in Proc. 39th
+Allerton Conf. Communication, Control, and Computing, Monticello,
+IL, Sept. 2001, pp. 1073–1074.
+[43] , “CDMA Codeword Optimization for Uplink Dispersive Channels
+Through Interference Avoidance,” IEEE Trans. Inform. Theory, sub-
+mitted for publication.
+[44] J. Concha and S. Ulukus, “Optimization of CDMA signature sequences
+in multipath channels,” in Proc. IEEE Vehicular Technology Conf., vol.
+3, May 2001, pp. 1978–1982.
+[45] S. Ulukus and R. D. Yates, “Optimum signature sequence sets for asyn-
+chronous CDMA systems,” in Proc. 38th Annual Allerton Conf. Com-
+munications, Control, and Computing, Oct. 2000.
+[46] , “Signature sequence optimization in asynchronous CDMA sys-
+tems,” in Proc. IEEE Int. Conf. Communications, vol. 2, June 2001, pp.
+545–549.
+[47] , “User capacity of asynchronous cdma systems with optimum sig-
+nature sequences,” IEEE Trans. Inform. Theory, to be published.
+[48] D. C. Popescu and C. Rose, “A New Approach to Multiple Antenna
+Systems: Sum Capacity Optimization Through Interference Avoidance,”
+IEEE J. Select. Areas Commun., submitted for publication.
+[49] D. Popescu and C. Rose, “Interference avoidance and multiaccess
+vector channels,” in Proc. Conf. Int. Symp. Information Theory,
+Lausanne, Switzerland, July 2002.
+[50] W. Yu, W. Rhee, S. Boyd, and J. M. Cioffi, “Iterative Water-Filling for
+Gaussian Vector Multiple Access Channels,” in Proc. 2001 Int. Symp.
+Information Theory, Washington, DC, June 2001.
+[51] D. C. Popescu and C. Rose, “Codeword Quantization for Interference
+Avoidance,” in Proc. 2000 Int. Conf. Acoustics, Speech, Signal Pro-
+cessing – ICASSP 2000, vol. 6, Istanbul, June 2000, pp. 3670–3673.
+[52] D. E. Tabora, “An Analysis of Covariance Estimation, Codeword
+Feedback, and Multiple Base Performance of Interference Avoidance,”
+Master’s thesis, Rutgers University, Dept. Elect. Comp. Eng., NJ, 2001.
+Christopher Rose (S’78–M’86) received the B.S.,
+M.S. and Ph.D. degrees from the Massachusetts In-
+stitute of Technology, Cambridge, Massachusetts, in
+1979, 1981 and 1985, respectively.
+Following graduate school, he joined AT&T
+Bell Laboratories, Holmdel, NJ, as a Member of
+the Network Systems Research Department. He is
+currently an Associate Professor of Electrical and
+Computer Engineering at Rutgers University, NJ,
+an Associate Director of the Wireless Networks
+Laboratory (WINLAB), as well as a Henry Rutgers
+Research Fellow. He is an editor for the ACM Wireless Networks (WINET)
+Journal, the Elsevier Computer Networks Journal, and has served on many
+conference technical program committees and was technical program Co-chair
+for MobiCom’97, Co-chair of the WINLAB Focus’98 on the U-NII, the
+WINLAB Berkeley Focus’99 on Radio Networks for Everything, and the
+Berkeley WINLAB Focus 2000 on Picoradio Networks. He has also served
+as General Chair of ACM SIGMobile MobiCom 2001 (Rome, July 2001). In
+December 1999, he served on an international panel to evaluate engineering
+teaching and research in Portugal. Closer to home, he has served on the Scien-
+tific Fields Advisory Committee of the New Jersey Commission on Science
+and Technology. His current technical interests include mobility management,
+novel mobile communications networks, applications of genetic algorithms to
+control problems in communications networks and most recently, interference
+avoidance methods using universal radios to foster peaceful coexistence in
+what will be the wireless ecology of the recently allocated 5GHz U-NII band.
+Dr. Rose is currently a member of the ACM MobiCom Steering Committee
+and is a past member of the ACM SIGMobile Executive Committee.
+Authorized licensed use limited to: Brown University. Downloaded on April 26,2026 at 18:59:18 UTC from IEEE Xplore. Restrictions apply.
+428 IEEE TRANSACTIONS ON WIRELESS COMMUNICATIONS, VOL. 1, NO. 3, JULY 2002
+Sennur Ulukus (S’90–M’98) received the B.S. and
+M.S. degrees in electrical and electronics engineering
+from Bilkent University, Ankara, Turkey, in 1991 and
+1993, respectively, and the Ph.D. degree in electrical
+and computer engineering from Rutgers University,
+NJ, in 1998.
+During her Ph.D. studies, she was with the Wire-
+less Information Network Laboratory (WINLAB),
+Rutgers University. From 1998 to 2001, she was a
+Senior Technical Staff Member at AT&T Labs-Re-
+search, City, NJ. Since August 2001, she is an
+Assistant Professor in the Department of Electrical and Computer Engineering
+at University of Maryland, College Park, Maryland, where she also holds a
+joint appoinment with the Institute for Systems Research. Her research interests
+are in the general area of wireless communication theory, with an emphasis
+on power control, multiuser detection, array signal processing, and signature
+sequence design techniques for wireless CDMA systems.
+Roy D. Yates (M’91) received the B.S.E. degree in
+1983 from Princeton University, Princeton, NJ, and
+the S.M. and Ph.D. degrees from Massachusetts in-
+stitute of Technology, Cambridge, MA, in 1986 and
+1990, respectively, all in electrical engineering,.
+Since 1990, he has been with the Wireless
+Information Networks Laboratory (WINLAB),
+Piscataway, NJ, and the Electrical and Computer
+Engineering Department at Rutgers University.
+Presently, he serves as Director of WINLAB and
+Associate Professor in the Electrical and Computer
+Engineering Department. He is an Associate Editor of the IEEE JOURNAL ON
+SELECTED AREAS IN COMMUNICATIONS Series in Wireless Communication. He
+is a coauthor (with David Goodman) of “Probability and Stochastic Processes:
+A Friendly Introduction for Electrical and Computer Engineers” (New York:
+Wiley). His research interests include power control, interference suppression,
+and media access protocols for wireless communications systems.
+Authorized licensed use limited to: Brown University. Downloaded on April 26,2026 at 18:59:18 UTC from IEEE Xplore. Restrictions apply.
